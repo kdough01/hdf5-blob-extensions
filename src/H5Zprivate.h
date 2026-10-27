@@ -185,6 +185,8 @@ typedef struct H5Z_entry_t {
     H5Z_read_blob_func_t   read_blob;   /* NULL selects the default H5HG reader */
     H5Z_delete_blob_func_t delete_blob; /* NULL selects the default H5HG reclaim */
     H5Z_close_blob_func_t  close_blob;  /* NULL and the library frees the buffer */
+    H5Z_dset_write_func_t  dset_write;  /* dataset-level write; may be NULL */
+    H5Z_dset_read_func_t   dset_read;   /* dataset-level read; may be NULL */
 } H5Z_entry_t;
 
 /*****************************/

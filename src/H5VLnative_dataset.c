@@ -366,6 +366,17 @@ H5VL__native_dataset_read(size_t count, void *obj[], hid_t mem_type_id[], hid_t 
                                       (H5_flexible_const_ptr_t *)buf, dinfo) < 0)
         HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "unable to set up file and memory dataspaces");
 
+    /* Offer a single-dataset request to the dataset's filter first */
+    if (1 == count) {
+        htri_t handled;
+
+        if ((handled = H5D__filter_dset_io(dinfo[0].dset, false, mem_type_id[0], mem_space_id[0],
+                                           file_space_id[0], dxpl_id, dinfo[0].buf)) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_READERROR, FAIL, "filter's dataset-level read failed");
+        if (handled)
+            HGOTO_DONE(SUCCEED);
+    }
+
     /* Set DXPL for operation */
     H5CX_set_dxpl(dxpl_id);
 
@@ -412,6 +423,17 @@ H5VL__native_dataset_write(size_t count, void *obj[], hid_t mem_type_id[], hid_t
     if (H5VL__native_dataset_io_setup(count, obj, mem_type_id, mem_space_id, file_space_id, dxpl_id,
                                       (H5_flexible_const_ptr_t *)buf, dinfo) < 0)
         HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "unable to set up file and memory dataspaces");
+
+    /* Offer a single-dataset request to the dataset's filter first */
+    if (1 == count) {
+        htri_t handled;
+
+        if ((handled = H5D__filter_dset_io(dinfo[0].dset, true, mem_type_id[0], mem_space_id[0],
+                                           file_space_id[0], dxpl_id, dinfo[0].buf)) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "filter's dataset-level write failed");
+        if (handled)
+            HGOTO_DONE(SUCCEED);
+    }
 
     /* Set DXPL for operation */
     H5CX_set_dxpl(dxpl_id);

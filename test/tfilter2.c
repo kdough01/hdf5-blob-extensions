@@ -42,6 +42,7 @@ static const char *FILENAME[] = {"tfilter2",
                                  "tfilter2_blob_share",
                                  "tfilter2_blob_cdel",
                                  "tfilter2_blob_noplug",
+                                 "tfilter2_dset_io",
                                  NULL};
 
 /* -----------------------------------------------------------------------
@@ -8053,6 +8054,427 @@ error:
 }
 
 /* -----------------------------------------------------------------------
+ * Dataset-level transfer callbacks: H5Z_class3_t dset_write / dset_read.
+ *
+ * The test filter stores an 8x8 int dataset (4x4 chunks) as ONE unit: the
+ * chunk at (0,0) holds all 64 values, the other three hold a 4-byte stub.
+ * The per-chunk callback could not produce or decode that layout, which is
+ * the point: a filter that sees the whole request can pick a compression
+ * unit other than one chunk, using nothing but H5Dwrite_chunk().
+ *
+ * The application's buffer is "opaque" when the DSETIO_OPAQUE property is
+ * on the DXPL: it then points at a dsetio_handle_t, not at 64 ints, and
+ * only the callback knows.  A library that touched the buffer before the
+ * callback would read the wrong bytes.
+ * ---------------------------------------------------------------------- */
+
+#define DSETIO_FILTER_ID 541
+#define DSETIO_OPAQUE    "dsetio_opaque"  /* buf is a dsetio_handle_t *       */
+#define DSETIO_DECLINE   "dsetio_decline" /* callback returns 0               */
+#define DSETIO_FAIL      "dsetio_fail"    /* callback returns -1              */
+#define DSETIO_RECURSE   "dsetio_recurse" /* callback re-enters H5Dread()     */
+#define DSETIO_STUB      0x42555453u      /* "STUB"                           */
+
+typedef struct dsetio_handle_t {
+    unsigned magic;
+    int     *data; /* the 64 ints */
+} dsetio_handle_t;
+
+static struct {
+    unsigned nwrite, nread; /* dataset-level callback invocations */
+    unsigned nchunk;        /* per-chunk callback invocations     */
+    unsigned nbad;          /* unexpected arguments               */
+    int      state_tag;     /* address init handed out            */
+} g_dsetio;
+
+static herr_t
+dsetio_init(hid_t H5_ATTR_UNUSED file_id, hid_t H5_ATTR_UNUSED dcpl_id, hid_t H5_ATTR_UNUSED type_id,
+            hid_t H5_ATTR_UNUSED space_id, unsigned H5_ATTR_UNUSED idx, void **state_out)
+{
+    *state_out = &g_dsetio.state_tag;
+    return 0;
+}
+
+static herr_t
+dsetio_term(void H5_ATTR_UNUSED *state)
+{
+    return 0;
+}
+
+static size_t
+dsetio_filter(unsigned int H5_ATTR_UNUSED flags, size_t H5_ATTR_UNUSED cd_nelmts,
+              const unsigned int H5_ATTR_UNUSED cd_values[], hid_t H5_ATTR_UNUSED dxpl_id,
+              const hsize_t H5_ATTR_UNUSED *scaled, size_t H5_ATTR_UNUSED ndims, void H5_ATTR_UNUSED *state,
+              size_t nbytes, size_t H5_ATTR_UNUSED *buf_size, void H5_ATTR_UNUSED **buf)
+{
+    g_dsetio.nchunk++;
+    return nbytes; /* pass-through */
+}
+
+/* Common argument checks; returns the callback's early verdict or 1 to go on */
+static htri_t
+dsetio_check(void *state, hid_t dset_id, hid_t mem_type_id, hid_t mem_space_id, hid_t file_space_id,
+             hid_t dxpl_id)
+{
+    if (state != &g_dsetio.state_tag || H5Iget_type(dset_id) != H5I_DATASET ||
+        H5Iget_type(dxpl_id) != H5I_GENPROP_LST || H5Tequal(mem_type_id, H5T_NATIVE_INT) <= 0) {
+        g_dsetio.nbad++;
+        return -1;
+    }
+    if (H5Pexist(dxpl_id, DSETIO_FAIL) > 0)
+        return -1;
+    if (H5Pexist(dxpl_id, DSETIO_DECLINE) > 0)
+        return 0;
+    /* This test filter only handles whole-dataset requests itself */
+    if (mem_space_id != H5S_ALL || file_space_id != H5S_ALL)
+        return 0;
+    return 1;
+}
+
+static htri_t
+dsetio_write(void *state, hid_t dset_id, hid_t mem_type_id, hid_t mem_space_id, hid_t file_space_id,
+             hid_t dxpl_id, const void *buf)
+{
+    const int *data = (const int *)buf;
+    htri_t     go;
+
+    g_dsetio.nwrite++;
+    if ((go = dsetio_check(state, dset_id, mem_type_id, mem_space_id, file_space_id, dxpl_id)) <= 0)
+        return go;
+
+    if (H5Pexist(dxpl_id, DSETIO_OPAQUE) > 0) {
+        const dsetio_handle_t *h = (const dsetio_handle_t *)buf;
+
+        if (h->magic != DSETIO_STUB)
+            return -1;
+        data = h->data;
+    }
+
+    /* One unit for the whole dataset, held by the first chunk */
+    for (hsize_t i = 0; i < 8; i += 4)
+        for (hsize_t j = 0; j < 8; j += 4) {
+            const hsize_t  offset[2] = {i, j};
+            const unsigned stub      = DSETIO_STUB;
+            const bool     leader    = (i == 0 && j == 0);
+
+            if (H5Dwrite_chunk(dset_id, dxpl_id, 0, offset, leader ? 64 * sizeof(int) : sizeof(stub),
+                               leader ? (const void *)data : (const void *)&stub) < 0)
+                return -1;
+        }
+    return 1;
+}
+
+static htri_t
+dsetio_read(void *state, hid_t dset_id, hid_t mem_type_id, hid_t mem_space_id, hid_t file_space_id,
+            hid_t dxpl_id, void *buf)
+{
+    const hsize_t offset[2] = {0, 0};
+    int          *data      = (int *)buf;
+    uint32_t      mask      = 0;
+    size_t        size      = 64 * sizeof(int);
+    htri_t        go;
+
+    g_dsetio.nread++;
+    if ((go = dsetio_check(state, dset_id, mem_type_id, mem_space_id, file_space_id, dxpl_id)) <= 0)
+        return go;
+
+    if (H5Pexist(dxpl_id, DSETIO_RECURSE) > 0) {
+        /* Not offered again: this goes down the per-chunk path */
+        hid_t  plain = H5Pcreate(H5P_DATASET_XFER);
+        herr_t st    = H5Dread(dset_id, mem_type_id, mem_space_id, file_space_id, plain, buf);
+
+        H5Pclose(plain);
+        return st < 0 ? -1 : 1;
+    }
+    if (H5Pexist(dxpl_id, DSETIO_OPAQUE) > 0) {
+        dsetio_handle_t *h = (dsetio_handle_t *)buf;
+
+        if (h->magic != DSETIO_STUB)
+            return -1;
+        data = h->data;
+    }
+    if (H5Dread_chunk2(dset_id, dxpl_id, offset, &mask, data, &size) < 0 || size != 64 * sizeof(int))
+        return -1;
+    return 1;
+}
+
+static const H5Z_class3_t dsetio_cls = {
+    2,                     /* version -- H5Z_class3_t */
+    DSETIO_FILTER_ID,      /* id */
+    1,                     /* encoder_present */
+    1,                     /* decoder_present */
+    "test_dset_io_filter", /* name */
+    NULL,                  /* can_apply */
+    NULL,                  /* set_local */
+    dsetio_filter,         /* filter */
+    NULL,                  /* set_config */
+    NULL,                  /* get_config */
+    NULL,                  /* description */
+    dsetio_init,           /* init */
+    dsetio_term,           /* term */
+    NULL,                  /* write_blob */
+    NULL,                  /* read_blob */
+    NULL,                  /* delete_blob */
+    NULL,                  /* close_blob */
+    dsetio_write,          /* dset_write */
+    dsetio_read,           /* dset_read */
+};
+
+static hid_t
+dsetio_create_dset(hid_t loc, const char *name, bool second_filter)
+{
+    static const hsize_t dims[2]   = {8, 8};
+    static const hsize_t chunks[2] = {4, 4};
+    hid_t                dcpl      = H5I_INVALID_HID;
+    hid_t                dapl      = H5I_INVALID_HID;
+    hid_t                sid       = H5I_INVALID_HID;
+    hid_t                dset      = H5I_INVALID_HID;
+
+    if ((sid = H5Screate_simple(2, dims, NULL)) < 0)
+        goto done;
+    if ((dcpl = H5Pcreate(H5P_DATASET_CREATE)) < 0)
+        goto done;
+    if (H5Pset_chunk(dcpl, 2, chunks) < 0)
+        goto done;
+    if (H5Pset_filter(dcpl, DSETIO_FILTER_ID, H5Z_FLAG_MANDATORY, 0, NULL) < 0)
+        goto done;
+    if (second_filter && H5Pset_fletcher32(dcpl) < 0)
+        goto done;
+    /* No chunk cache, so the per-chunk callback runs inside H5Dwrite/H5Dread */
+    if ((dapl = H5Pcreate(H5P_DATASET_ACCESS)) < 0)
+        goto done;
+    if (H5Pset_chunk_cache(dapl, 0, H5D_CHUNK_CACHE_NBYTES_DEFAULT, H5D_CHUNK_CACHE_W0_DEFAULT) < 0)
+        goto done;
+    dset = H5Dcreate2(loc, name, H5T_NATIVE_INT, sid, H5P_DEFAULT, dcpl, dapl);
+
+done:
+    H5E_BEGIN_TRY
+    {
+        H5Pclose(dapl);
+        H5Pclose(dcpl);
+        H5Sclose(sid);
+    }
+    H5E_END_TRY
+    return dset;
+}
+
+static int
+test_filter_dset_io(hid_t fapl_in)
+{
+    hid_t           fapl = H5I_INVALID_HID, file = H5I_INVALID_HID, dset = H5I_INVALID_HID;
+    hid_t           dxpl = H5I_INVALID_HID, sid = H5I_INVALID_HID, msid = H5I_INVALID_HID;
+    int             wbuf[64], rbuf[64], one                             = 1;
+    dsetio_handle_t wh = {DSETIO_STUB, wbuf}, rh = {DSETIO_STUB, rbuf};
+    char            filename[1024];
+    herr_t          ret;
+
+    for (int i = 0; i < 64; i++)
+        wbuf[i] = i * 7 + 1;
+
+    if ((fapl = H5Pcopy(fapl_in)) < 0)
+        TEST_ERROR;
+    h5_fixname(FILENAME[20], fapl, filename, sizeof(filename));
+    if (H5Zregister(&dsetio_cls) < 0)
+        TEST_ERROR;
+    if ((file = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, fapl)) < 0)
+        TEST_ERROR;
+
+    /* ------------------------------------------------------------------ */
+    TESTING("filter dataset I/O: opaque buffer, unit larger than a chunk");
+
+    memset(&g_dsetio, 0, sizeof(g_dsetio));
+    if ((dset = dsetio_create_dset(file, "unit", false)) < 0)
+        TEST_ERROR;
+    if ((dxpl = H5Pcreate(H5P_DATASET_XFER)) < 0)
+        TEST_ERROR;
+    if (H5Pinsert2(dxpl, DSETIO_OPAQUE, sizeof(int), &one, NULL, NULL, NULL, NULL, NULL, NULL) < 0)
+        TEST_ERROR;
+    if (H5Fget_obj_count(file, H5F_OBJ_DATASET) != 1)
+        TEST_ERROR;
+
+    /* buf is NOT 64 ints here; only the filter can interpret it */
+    if (H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, dxpl, &wh) < 0)
+        TEST_ERROR;
+    memset(rbuf, 0, sizeof(rbuf));
+    if (H5Dread(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, dxpl, &rh) < 0)
+        TEST_ERROR;
+    if (memcmp(wbuf, rbuf, sizeof(wbuf)) != 0)
+        TEST_ERROR;
+    /* The filter did both transfers; the per-chunk callback never ran */
+    if (g_dsetio.nwrite != 1 || g_dsetio.nread != 1 || g_dsetio.nchunk != 0 || g_dsetio.nbad != 0)
+        TEST_ERROR;
+    /* One 256-byte unit + three 4-byte stubs, in the dataset's own chunks */
+    if (H5Dget_storage_size(dset) != 64 * sizeof(int) + 3 * sizeof(unsigned))
+        TEST_ERROR;
+    /* The temporary ID is gone and the caller's ID still works */
+    if (H5Fget_obj_count(file, H5F_OBJ_DATASET) != 1 || H5Iis_valid(dset) <= 0)
+        TEST_ERROR;
+
+    /* Reopen: state is rebuilt at open and the read is offered again */
+    if (H5Dclose(dset) < 0)
+        TEST_ERROR;
+    if ((dset = H5Dopen2(file, "unit", H5P_DEFAULT)) < 0)
+        TEST_ERROR;
+    memset(rbuf, 0, sizeof(rbuf));
+    if (H5Dread(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, rbuf) < 0)
+        TEST_ERROR;
+    if (memcmp(wbuf, rbuf, sizeof(wbuf)) != 0 || g_dsetio.nread != 2 || g_dsetio.nchunk != 0)
+        TEST_ERROR;
+    if (H5Dclose(dset) < 0)
+        TEST_ERROR;
+    dset = H5I_INVALID_HID;
+    PASSED();
+
+    /* ------------------------------------------------------------------ */
+    TESTING("filter dataset I/O: declining falls back to the per-chunk path");
+
+    memset(&g_dsetio, 0, sizeof(g_dsetio));
+    if ((dset = dsetio_create_dset(file, "decline", false)) < 0)
+        TEST_ERROR;
+    if (H5Premove(dxpl, DSETIO_OPAQUE) < 0)
+        TEST_ERROR;
+    if (H5Pinsert2(dxpl, DSETIO_DECLINE, sizeof(int), &one, NULL, NULL, NULL, NULL, NULL, NULL) < 0)
+        TEST_ERROR;
+    if (H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, dxpl, wbuf) < 0)
+        TEST_ERROR;
+    memset(rbuf, 0, sizeof(rbuf));
+    if (H5Dread(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, dxpl, rbuf) < 0)
+        TEST_ERROR;
+    if (memcmp(wbuf, rbuf, sizeof(wbuf)) != 0)
+        TEST_ERROR;
+    /* Offered once each way, then 4 chunks written + 4 read normally */
+    if (g_dsetio.nwrite != 1 || g_dsetio.nread != 1 || g_dsetio.nchunk != 8 || g_dsetio.nbad != 0)
+        TEST_ERROR;
+    if (H5Dget_storage_size(dset) != 64 * sizeof(int))
+        TEST_ERROR;
+
+    /* A partial selection: this filter declines, the library does it */
+    {
+        const hsize_t start[2] = {2, 2}, count[2] = {4, 4};
+        int           part[16];
+
+        if ((msid = H5Screate_simple(2, count, NULL)) < 0)
+            TEST_ERROR;
+        if ((sid = H5Dget_space(dset)) < 0)
+            TEST_ERROR;
+        if (H5Sselect_hyperslab(sid, H5S_SELECT_SET, start, NULL, count, NULL) < 0)
+            TEST_ERROR;
+        if (H5Dread(dset, H5T_NATIVE_INT, msid, sid, H5P_DEFAULT, part) < 0)
+            TEST_ERROR;
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++)
+                if (part[i * 4 + j] != wbuf[(i + 2) * 8 + (j + 2)])
+                    TEST_ERROR;
+        /* Offered (and declined) once more; all 4 chunks intersect the slab */
+        if (g_dsetio.nread != 2 || g_dsetio.nchunk != 12)
+            TEST_ERROR;
+        /* H5S_BLOCK is never offered */
+        if (H5Dread(dset, H5T_NATIVE_INT, H5S_BLOCK, sid, H5P_DEFAULT, part) < 0)
+            TEST_ERROR;
+        if (g_dsetio.nread != 2 || g_dsetio.nchunk != 16)
+            TEST_ERROR;
+        if (H5Sclose(sid) < 0)
+            TEST_ERROR;
+        sid = H5I_INVALID_HID;
+        if (H5Sclose(msid) < 0)
+            TEST_ERROR;
+        msid = H5I_INVALID_HID;
+    }
+    PASSED();
+
+    /* ------------------------------------------------------------------ */
+    TESTING("filter dataset I/O: callback failure fails the request");
+
+    memset(&g_dsetio, 0, sizeof(g_dsetio));
+    if (H5Premove(dxpl, DSETIO_DECLINE) < 0)
+        TEST_ERROR;
+    if (H5Pinsert2(dxpl, DSETIO_FAIL, sizeof(int), &one, NULL, NULL, NULL, NULL, NULL, NULL) < 0)
+        TEST_ERROR;
+    H5E_BEGIN_TRY
+    {
+        ret = H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, dxpl, wbuf);
+    }
+    H5E_END_TRY
+    if (ret >= 0)
+        TEST_ERROR;
+    H5E_BEGIN_TRY
+    {
+        ret = H5Dread(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, dxpl, rbuf);
+    }
+    H5E_END_TRY
+    if (ret >= 0)
+        TEST_ERROR;
+    /* Neither request reached the per-chunk path, and the dataset survives */
+    if (g_dsetio.nwrite != 1 || g_dsetio.nread != 1 || g_dsetio.nchunk != 0)
+        TEST_ERROR;
+    if (H5Fget_obj_count(file, H5F_OBJ_DATASET) != 1 || H5Iis_valid(dset) <= 0)
+        TEST_ERROR;
+    PASSED();
+
+    /* ------------------------------------------------------------------ */
+    TESTING("filter dataset I/O: not offered recursively");
+
+    memset(&g_dsetio, 0, sizeof(g_dsetio));
+    if (H5Premove(dxpl, DSETIO_FAIL) < 0)
+        TEST_ERROR;
+    if (H5Pinsert2(dxpl, DSETIO_RECURSE, sizeof(int), &one, NULL, NULL, NULL, NULL, NULL, NULL) < 0)
+        TEST_ERROR;
+    memset(rbuf, 0, sizeof(rbuf));
+    if (H5Dread(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, dxpl, rbuf) < 0)
+        TEST_ERROR;
+    /* One offer; the nested H5Dread ran the 4 chunks through filter2 */
+    if (memcmp(wbuf, rbuf, sizeof(wbuf)) != 0 || g_dsetio.nread != 1 || g_dsetio.nchunk != 4)
+        TEST_ERROR;
+    if (H5Dclose(dset) < 0)
+        TEST_ERROR;
+    dset = H5I_INVALID_HID;
+    PASSED();
+
+    /* ------------------------------------------------------------------ */
+    TESTING("filter dataset I/O: not offered when the pipeline has other filters");
+
+    memset(&g_dsetio, 0, sizeof(g_dsetio));
+    if ((dset = dsetio_create_dset(file, "two", true)) < 0)
+        TEST_ERROR;
+    if (H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, wbuf) < 0)
+        TEST_ERROR;
+    memset(rbuf, 0, sizeof(rbuf));
+    if (H5Dread(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, rbuf) < 0)
+        TEST_ERROR;
+    if (memcmp(wbuf, rbuf, sizeof(wbuf)) != 0 || g_dsetio.nwrite != 0 || g_dsetio.nread != 0 ||
+        g_dsetio.nchunk != 8)
+        TEST_ERROR;
+    if (H5Dclose(dset) < 0)
+        TEST_ERROR;
+    dset = H5I_INVALID_HID;
+    PASSED();
+
+    if (H5Pclose(dxpl) < 0)
+        TEST_ERROR;
+    if (H5Fclose(file) < 0)
+        TEST_ERROR;
+    if (H5Pclose(fapl) < 0)
+        TEST_ERROR;
+    if (H5Zunregister(DSETIO_FILTER_ID) < 0)
+        TEST_ERROR;
+    return 0;
+
+error:
+    H5E_BEGIN_TRY
+    {
+        H5Sclose(sid);
+        H5Sclose(msid);
+        H5Pclose(dxpl);
+        H5Dclose(dset);
+        H5Fclose(file);
+        H5Pclose(fapl);
+        H5Zunregister(DSETIO_FILTER_ID);
+    }
+    H5E_END_TRY
+    return -1;
+}
+
+/* -----------------------------------------------------------------------
  * main
  * ---------------------------------------------------------------------- */
 int
@@ -8165,6 +8587,9 @@ main(void)
 
     /* Per-dataset filter state (init/term) */
     nerrors += test_filter_state(fapl) < 0 ? 1 : 0;
+
+    /* Dataset-level transfer callbacks (dset_write/dset_read) */
+    nerrors += test_filter_dset_io(fapl) < 0 ? 1 : 0;
 
     if (H5Fclose(file) < 0)
         goto error;

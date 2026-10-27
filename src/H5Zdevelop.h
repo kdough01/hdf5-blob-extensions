@@ -496,6 +496,67 @@ typedef herr_t (*H5Z_init_func_t)(hid_t file_id, hid_t dcpl_id, hid_t type_id, h
 typedef herr_t (*H5Z_term_func_t)(void *state);
 
 /**
+ * \brief Callback offering a whole H5Dwrite() request to a filter.
+ *
+ * \param[in] state         The value this pipeline entry's \c init callback
+ *                          stored; NULL when the class has no \c init.
+ * \param[in] dset_id       The dataset being written. Valid only for the
+ *                          duration of the call; the callback must not close it.
+ * \param[in] mem_type_id   Memory datatype passed to H5Dwrite().
+ * \param[in] mem_space_id  Memory dataspace passed to H5Dwrite(); may be #H5S_ALL.
+ * \param[in] file_space_id File dataspace passed to H5Dwrite(); may be #H5S_ALL.
+ * \param[in] dxpl_id       Dataset transfer property list of the request.
+ * \param[in] buf           The application's buffer, passed through untouched.
+ *                          The library never dereferences it before this call,
+ *                          so it may be memory only the filter knows how to
+ *                          read (for example a GPU device pointer announced by
+ *                          a property the filter defines on \p dxpl_id).
+ *
+ * \return Positive if the filter wrote the selected elements itself, zero to
+ *         decline (the library then performs the request through its normal
+ *         per-chunk path, exactly as if this callback were NULL), negative on
+ *         failure (H5Dwrite() fails).
+ *
+ * \details The per-chunk callback (\c H5Z_func2_t) sees one host-memory chunk
+ *          at a time, after the library has copied the data out of the
+ *          application's buffer and usually long after H5Dwrite() returned.
+ *          This callback instead sees the request as the application made it,
+ *          before the library touches \p buf. A filter that defines it can
+ *          therefore (a) compress straight from memory the library cannot
+ *          read, and (b) choose a compression unit other than one chunk, by
+ *          storing what it produces with H5Dwrite_chunk(). Everything the
+ *          filter stores this way still lives in the dataset's own chunks, so
+ *          the file format, the chunk index and H5Ocopy() are unaffected.
+ *
+ *          The request is offered only for a chunked dataset whose pipeline
+ *          consists of this one filter, only for single-dataset requests
+ *          (not H5Dwrite_multi() with more than one dataset), never with
+ *          #H5S_BLOCK or #H5S_PLIST selections, and never in a file opened
+ *          with an MPI file driver. It is not offered recursively: an
+ *          H5Dwrite() or H5Dread() the callback itself issues on \p dset_id
+ *          takes the normal per-chunk path.
+ *
+ * \since 3.0.0
+ */
+typedef htri_t (*H5Z_dset_write_func_t)(void *state, hid_t dset_id, hid_t mem_type_id, hid_t mem_space_id,
+                                        hid_t file_space_id, hid_t dxpl_id, const void *buf);
+
+/**
+ * \brief Callback offering a whole H5Dread() request to a filter.
+ *
+ * Parameters, return value and the conditions under which the request is
+ * offered are those of \c H5Z_dset_write_func_t, with \p buf the buffer to
+ * fill. A filter that stores more (or less) than one chunk's data per chunk
+ * with its \c dset_write callback reads it back here with H5Dread_chunk();
+ * \p dxpl_id lets one read ask for something other than the default decode
+ * (a region, a reduced fidelity) without that choice being cached.
+ *
+ * \since 3.0.0
+ */
+typedef htri_t (*H5Z_dset_read_func_t)(void *state, hid_t dset_id, hid_t mem_type_id, hid_t mem_space_id,
+                                       hid_t file_space_id, hid_t dxpl_id, void *buf);
+
+/**
  * \brief Version 3 filter class structure with optional string-configuration,
  *        per-dataset state, and blob-storage callbacks.
  *
@@ -542,6 +603,8 @@ typedef struct H5Z_class3_t {
                                            global-heap reclaim (with write_blob and read_blob) */
     H5Z_close_blob_func_t close_blob;   /**< Blob release callback; NULL and the library
                                            frees the buffer itself */
+    H5Z_dset_write_func_t dset_write;   /**< Dataset-level write callback; may be NULL */
+    H5Z_dset_read_func_t  dset_read;    /**< Dataset-level read callback; may be NULL */
 } H5Z_class3_t;
 //! <!-- [H5Z_class3_t_snip] -->
 

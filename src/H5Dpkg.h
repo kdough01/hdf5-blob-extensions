@@ -593,6 +593,7 @@ struct H5D_shared_t {
      * at open, so its init (if any) runs in H5D__filter_state_ensure() */
     bool filter_state_pending;
     bool filter_state_load_tried; /* H5D__filter_state_ensure() has tried loading plugins */
+    bool filter_dset_io_active;   /* Inside the filter's dset_read/dset_write callback */
 
     /* Cached dataspace info */
     unsigned ndims;                       /* The dataset's dataspace rank */
@@ -722,6 +723,11 @@ H5_DLL herr_t H5D__format_convert(H5D_t *dataset);
  * available; callers test dset->shared->filter_state_pending first, so the
  * common case costs one flag check.  Call before the dataset's pipeline runs. */
 H5_DLL herr_t H5D__filter_state_ensure(const H5D_t *dset);
+/* Offer one H5Dread()/H5Dwrite() request to the dataset's filter (H5Z_class3_t
+ * dset_read / dset_write).  Positive: the filter did the transfer; zero: not
+ * offered or declined, do the normal I/O; negative: error. */
+H5_DLL htri_t H5D__filter_dset_io(H5D_t *dset, bool write_op, hid_t mem_type_id, hid_t mem_space_id,
+                                  hid_t file_space_id, hid_t dxpl_id, H5_flexible_const_ptr_t buf);
 
 /* Internal I/O routines */
 H5_DLL herr_t H5D__read(size_t count, H5D_dset_io_info_t *dset_info);

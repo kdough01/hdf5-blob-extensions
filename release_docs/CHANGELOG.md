@@ -175,6 +175,21 @@ We would like to thank the many HDF5 community members who contributed to this r
    at first I/O; a plugin that cannot be loaded is still not an error at open.
    Filters that define `init` cannot be used on group (fractal heap) storage.
 
+   **Dataset-level transfer callbacks:**  `H5Z_class3_t` also gains optional
+   `dset_write` and `dset_read` callbacks, appended after `close_blob`.  When
+   a chunked dataset's pipeline consists of one filter that defines them,
+   `H5Dwrite` / `H5Dread` offer the whole request to the filter before the
+   library touches the application's buffer or decomposes the selection into
+   chunks.  The callback returns positive if it did the transfer, zero to
+   decline (the library then does its normal per-chunk I/O), or negative on
+   error.  It receives the per-dataset `state`, a temporary dataset ID, and
+   the request's datatype, dataspaces, DXPL and buffer unchanged, and stores
+   or fetches data with `H5Dwrite_chunk` / `H5Dread_chunk`.  This lets a
+   filter compress from memory the library cannot read (a GPU device buffer),
+   use a compression unit larger or smaller than a storage chunk, and vary
+   what one read decodes (a region, a reduced fidelity) per transfer -- with
+   no change to the file format.
+
    **TOML subset parser:**  The [tomlc17](https://github.com/cktan/tomlc17)
    library is now vendored in `src/tomlc17/` and compiled unconditionally into
    libhdf5.  Hex-float literals (`0x1.8p+1`) in parameter strings are

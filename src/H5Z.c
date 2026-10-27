@@ -588,6 +588,8 @@ H5Z_register3(const H5Z_class3_t *cls)
     entry.close_blob           = cls->close_blob;
     entry.init                 = cls->init;
     entry.term                 = cls->term;
+    entry.dset_write           = cls->dset_write;
+    entry.dset_read            = cls->dset_read;
 
     if (H5Z__insert_entry(&entry) < 0)
         HGOTO_ERROR(H5E_PLINE, H5E_CANTINIT, FAIL, "unable to insert filter into table");

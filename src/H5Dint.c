@@ -3431,6 +3431,111 @@ done:
 } /* end H5D__filter_state_ensure() */
 
 /*-------------------------------------------------------------------------
+ * Function: H5D__filter_dset_io
+ *
+ * Purpose:  Offers one whole H5Dread()/H5Dwrite() request to the dataset's
+ *           filter, when that filter's class defines the matching
+ *           dataset-level callback (H5Z_class3_t dset_read / dset_write).
+ *
+ *           Called before any I/O setup, so the application's buffer has
+ *           not been touched and no chunk is locked: the callback is free
+ *           to use H5Dwrite_chunk()/H5Dread_chunk() on the temporary
+ *           dataset ID it is handed.
+ *
+ *           Offered only for a chunked dataset whose pipeline is that one
+ *           filter (a callback that stores chunks itself would bypass any
+ *           other entry), and never recursively.
+ *
+ * Return:   Positive if the filter performed the transfer, zero if the
+ *           request was not offered or the filter declined it (the caller
+ *           then does the normal per-chunk I/O), negative on failure.
+ *-------------------------------------------------------------------------
+ */
+htri_t
+H5D__filter_dset_io(H5D_t *dset, bool write_op, hid_t mem_type_id, hid_t mem_space_id, hid_t file_space_id,
+                    hid_t dxpl_id, H5_flexible_const_ptr_t buf)
+{
+    H5D_shared_t  *shared    = dset->shared;
+    H5Z_entry_t   *entry     = NULL;            /* The filter's class */
+    H5VL_object_t *vol_obj   = NULL;            /* VOL object stored with the temporary ID */
+    hid_t          dset_id   = H5I_INVALID_HID; /* Temporary ID for the callback */
+    bool           active    = false;           /* This call set filter_dset_io_active */
+    htri_t         status    = 0;               /* Callback's return value */
+    htri_t         ret_value = false;
+
+    FUNC_ENTER_PACKAGE_TAG(dset->oloc.addr)
+
+    /* Requests that are never offered */
+    if (H5D_CHUNKED != shared->layout.type || 1 != shared->dcpl_cache.pline.nused ||
+        shared->filter_dset_io_active || H5S_BLOCK == mem_space_id || H5S_PLIST == file_space_id ||
+        NULL == dset->oloc.file)
+        HGOTO_DONE(false);
+    if (H5F_HAS_FEATURE(dset->oloc.file, H5FD_FEAT_HAS_MPI))
+        HGOTO_DONE(false);
+    /* A write to a read-only file is reported by the normal path */
+    if (write_op && 0 == (H5F_INTENT(dset->oloc.file) & H5F_ACC_RDWR))
+        HGOTO_DONE(false);
+
+    /* Run init deferred from open (loading the plugin if need be), so the
+     * class and its state are available */
+    if (shared->filter_state_pending && H5D__filter_state_ensure(dset) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "unable to initialize filter state");
+
+    if (H5Z_find_entry(true, shared->dcpl_cache.pline.filter[0].id, &entry) < 0)
+        HGOTO_ERROR(H5E_PLINE, H5E_CANTGET, FAIL, "can't look up filter class");
+    if (NULL == entry || (write_op ? NULL == entry->dset_write : NULL == entry->dset_read))
+        HGOTO_DONE(false);
+    /* Without its state the filter cannot run; the normal path reports why */
+    if (entry->init && shared->dcpl_cache.pline.filter[0].state_status != H5Z_STATE_READY)
+        HGOTO_DONE(false);
+
+    /* A temporary ID for the callback; removed again below without closing
+     * the dataset */
+    if ((dset_id = H5VL_wrap_register(H5I_DATASET, dset, false)) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTREGISTER, FAIL, "can't register (temporary) dataset ID");
+
+    shared->filter_dset_io_active = active = true;
+
+    H5_BEFORE_USER_CB(FAIL)
+        {
+            void *fstate = shared->dcpl_cache.pline.filter[0].state;
+
+            if (write_op)
+                status = (entry->dset_write)(fstate, dset_id, mem_type_id, mem_space_id, file_space_id,
+                                             dxpl_id, buf.cvp);
+            else
+                status = (entry->dset_read)(fstate, dset_id, mem_type_id, mem_space_id, file_space_id,
+                                            dxpl_id, buf.vp);
+        }
+    H5_AFTER_USER_CB(FAIL)
+
+    if (status < 0)
+        HGOTO_ERROR(H5E_PLINE, write_op ? H5E_WRITEERROR : H5E_READERROR, FAIL,
+                    "dataset-level callback of filter %d failed", (int)entry->base.id);
+
+    ret_value = (status > 0);
+
+done:
+    if (active)
+        shared->filter_dset_io_active = false;
+
+    /* Discard the temporary identifier, leaving the dataset open */
+    if (dset_id != H5I_INVALID_HID) {
+        if (NULL == (vol_obj = (H5VL_object_t *)H5I_remove(dset_id)))
+            HDONE_ERROR(H5E_DATASET, H5E_CANTREMOVE, FAIL, "can't unregister (temporary) dataset ID");
+        else {
+            if (NULL == H5VL_object_unwrap(vol_obj))
+                HDONE_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't retrieve library object from VOL object");
+            H5VL_OBJ_DATA_RESET(vol_obj);
+            if (H5VL_free_object(vol_obj) < 0)
+                HDONE_ERROR(H5E_DATASET, H5E_CANTDEC, FAIL, "unable to free VOL object");
+        }
+    }
+
+    FUNC_LEAVE_NOAPI_TAG(ret_value)
+} /* end H5D__filter_dset_io() */
+
+/*-------------------------------------------------------------------------
  * Function: H5D__format_convert
  *
  * Purpose:  For chunked: downgrade the chunk indexing type to version 1 B-tree

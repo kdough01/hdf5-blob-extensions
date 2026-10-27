@@ -41,6 +41,8 @@ H5_ATTR_VISIBILITY_HIDDEN const H5Z_class3_t H5Z_FLETCHER32[1] = {{
     NULL,                                                /* read_blob */
     NULL,                                                /* delete_blob */
     NULL,                                                /* close_blob */
+    NULL,                                                /* dset_write */
+    NULL,                                                /* dset_read */
 }};
 
 #define FLETCHER_LEN 4

@@ -103,6 +103,8 @@ H5_ATTR_VISIBILITY_HIDDEN H5Z_class3_t H5Z_NBIT[1] = {{
     NULL, /* read_blob */
     NULL, /* delete_blob */
     NULL, /* close_blob */
+    NULL, /* dset_write */
+    NULL, /* dset_read */
 }};
 
 /* Local macros */
