@@ -203,4 +203,10 @@ H5_DLL herr_t H5D_virtual_free_parsed_name(H5O_storage_virtual_name_seg_t *name_
 H5_DLL herr_t H5D_btree_debug(H5F_t *f, haddr_t addr, FILE *stream, int indent, int fwidth, unsigned ndims,
                               const uint32_t *dim);
 
+/* Run the pipeline entries before or after the dataset-level filter whose
+ * callback is running (H5Zapply_pipeline) */
+H5_DLL herr_t H5D_filter_dset_io_pipeline(H5D_t *dset, unsigned part, unsigned flags, hid_t dxpl_id,
+                                          const hsize_t *scaled, unsigned *filter_mask, size_t *nbytes,
+                                          size_t *buf_size, void **buf);
+
 #endif /* H5Dprivate_H */

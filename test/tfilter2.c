@@ -8150,18 +8150,38 @@ dsetio_write(void *state, hid_t dset_id, hid_t mem_type_id, hid_t mem_space_id, 
         data = h->data;
     }
 
-    /* One unit for the whole dataset, held by the first chunk */
-    for (hsize_t i = 0; i < 8; i += 4)
-        for (hsize_t j = 0; j < 8; j += 4) {
-            const hsize_t  offset[2] = {i, j};
-            const unsigned stub      = DSETIO_STUB;
-            const bool     leader    = (i == 0 && j == 0);
+    /* One unit for the whole dataset, held by the first chunk.  The other
+     * pipeline entries run on the unit: those before this filter on its
+     * input, those after it on its output (this filter's "codec" is the
+     * identity, so the two runs follow each other directly) */
+    {
+        size_t   nbytes = 64 * sizeof(int), buf_size = nbytes;
+        unsigned mask = 0;
+        void    *unit = H5allocate_memory(buf_size, false);
+        herr_t   st   = -1;
 
-            if (H5Dwrite_chunk(dset_id, dxpl_id, 0, offset, leader ? 64 * sizeof(int) : sizeof(stub),
-                               leader ? (const void *)data : (const void *)&stub) < 0)
-                return -1;
+        if (NULL == unit)
+            return -1;
+        memcpy(unit, data, nbytes);
+        if (H5Zapply_pipeline(dset_id, H5Z_PIPELINE_BEFORE, 0, dxpl_id, NULL, &mask, &nbytes, &buf_size,
+                              &unit) >= 0 &&
+            H5Zapply_pipeline(dset_id, H5Z_PIPELINE_AFTER, 0, dxpl_id, NULL, &mask, &nbytes, &buf_size,
+                              &unit) >= 0) {
+            st = 0;
+            for (hsize_t i = 0; i < 8 && st >= 0; i += 4)
+                for (hsize_t j = 0; j < 8 && st >= 0; j += 4) {
+                    const hsize_t  offset[2] = {i, j};
+                    const unsigned stub      = DSETIO_STUB;
+                    const bool     leader    = (i == 0 && j == 0);
+
+                    st = H5Dwrite_chunk(dset_id, dxpl_id, leader ? mask : 0, offset,
+                                        leader ? nbytes : sizeof(stub),
+                                        leader ? (const void *)unit : (const void *)&stub);
+                }
         }
-    return 1;
+        H5free_memory(unit);
+        return st < 0 ? -1 : 1;
+    }
 }
 
 static htri_t
@@ -8193,9 +8213,29 @@ dsetio_read(void *state, hid_t dset_id, hid_t mem_type_id, hid_t mem_space_id, h
             return -1;
         data = h->data;
     }
-    if (H5Dread_chunk2(dset_id, dxpl_id, offset, &mask, data, &size) < 0 || size != 64 * sizeof(int))
-        return -1;
-    return 1;
+    {
+        hsize_t stored = 0;
+        size_t  nbytes, buf_size;
+        void   *unit;
+        herr_t  st = -1;
+
+        if (H5Dget_chunk_storage_size(dset_id, offset, &stored) < 0 || 0 == stored)
+            return -1;
+        nbytes = buf_size = size = (size_t)stored;
+        if (NULL == (unit = H5allocate_memory(buf_size, false)))
+            return -1;
+        if (H5Dread_chunk2(dset_id, dxpl_id, offset, &mask, unit, &size) >= 0 && size == nbytes &&
+            H5Zapply_pipeline(dset_id, H5Z_PIPELINE_AFTER, H5Z_FLAG_REVERSE, dxpl_id, NULL, &mask, &nbytes,
+                              &buf_size, &unit) >= 0 &&
+            H5Zapply_pipeline(dset_id, H5Z_PIPELINE_BEFORE, H5Z_FLAG_REVERSE, dxpl_id, NULL, &mask, &nbytes,
+                              &buf_size, &unit) >= 0 &&
+            nbytes == 64 * sizeof(int)) {
+            memcpy(data, unit, nbytes);
+            st = 0;
+        }
+        H5free_memory(unit);
+        return st < 0 ? -1 : 1;
+    }
 }
 
 static const H5Z_class3_t dsetio_cls = {
@@ -8221,7 +8261,9 @@ static const H5Z_class3_t dsetio_cls = {
 };
 
 static hid_t
-dsetio_create_dset(hid_t loc, const char *name, bool second_filter)
+/* OTHERS: 0 none, 1 fletcher32 after the filter, 2 shuffle before it,
+ * 3 the filter itself twice */
+dsetio_create_dset(hid_t loc, const char *name, int others)
 {
     static const hsize_t dims[2]   = {8, 8};
     static const hsize_t chunks[2] = {4, 4};
@@ -8236,9 +8278,13 @@ dsetio_create_dset(hid_t loc, const char *name, bool second_filter)
         goto done;
     if (H5Pset_chunk(dcpl, 2, chunks) < 0)
         goto done;
+    if (2 == others && H5Pset_shuffle(dcpl) < 0)
+        goto done;
     if (H5Pset_filter(dcpl, DSETIO_FILTER_ID, H5Z_FLAG_MANDATORY, 0, NULL) < 0)
         goto done;
-    if (second_filter && H5Pset_fletcher32(dcpl) < 0)
+    if (1 == others && H5Pset_fletcher32(dcpl) < 0)
+        goto done;
+    if (3 == others && H5Pset_filter(dcpl, DSETIO_FILTER_ID, H5Z_FLAG_MANDATORY, 0, NULL) < 0)
         goto done;
     /* No chunk cache, so the per-chunk callback runs inside H5Dwrite/H5Dread */
     if ((dapl = H5Pcreate(H5P_DATASET_ACCESS)) < 0)
@@ -8283,7 +8329,7 @@ test_filter_dset_io(hid_t fapl_in)
     TESTING("filter dataset I/O: opaque buffer, unit larger than a chunk");
 
     memset(&g_dsetio, 0, sizeof(g_dsetio));
-    if ((dset = dsetio_create_dset(file, "unit", false)) < 0)
+    if ((dset = dsetio_create_dset(file, "unit", 0)) < 0)
         TEST_ERROR;
     if ((dxpl = H5Pcreate(H5P_DATASET_XFER)) < 0)
         TEST_ERROR;
@@ -8329,7 +8375,7 @@ test_filter_dset_io(hid_t fapl_in)
     TESTING("filter dataset I/O: declining falls back to the per-chunk path");
 
     memset(&g_dsetio, 0, sizeof(g_dsetio));
-    if ((dset = dsetio_create_dset(file, "decline", false)) < 0)
+    if ((dset = dsetio_create_dset(file, "decline", 0)) < 0)
         TEST_ERROR;
     if (H5Premove(dxpl, DSETIO_OPAQUE) < 0)
         TEST_ERROR;
@@ -8431,22 +8477,187 @@ test_filter_dset_io(hid_t fapl_in)
     PASSED();
 
     /* ------------------------------------------------------------------ */
-    TESTING("filter dataset I/O: not offered when the pipeline has other filters");
+    TESTING("filter dataset I/O: other filters run per unit (after: fletcher32)");
 
     memset(&g_dsetio, 0, sizeof(g_dsetio));
-    if ((dset = dsetio_create_dset(file, "two", true)) < 0)
+    if ((dset = dsetio_create_dset(file, "after", 1)) < 0)
         TEST_ERROR;
     if (H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, wbuf) < 0)
         TEST_ERROR;
     memset(rbuf, 0, sizeof(rbuf));
     if (H5Dread(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, rbuf) < 0)
         TEST_ERROR;
-    if (memcmp(wbuf, rbuf, sizeof(wbuf)) != 0 || g_dsetio.nwrite != 0 || g_dsetio.nread != 0 ||
-        g_dsetio.nchunk != 8)
+    /* Offered both ways, the per-chunk pipeline never ran */
+    if (memcmp(wbuf, rbuf, sizeof(wbuf)) != 0 || g_dsetio.nwrite != 1 || g_dsetio.nread != 1 ||
+        g_dsetio.nchunk != 0)
+        TEST_ERROR;
+    /* fletcher32 added its 4-byte checksum to the unit once */
+    if (H5Dget_storage_size(dset) != 64 * sizeof(int) + 4 + 3 * sizeof(unsigned))
+        TEST_ERROR;
+    /* ... and verifies it on read: corrupt one byte of the stored unit */
+    {
+        const hsize_t origin[2] = {0, 0};
+        unsigned char raw[64 * sizeof(int) + 4];
+        size_t        rsize = sizeof(raw);
+        uint32_t      fmask = 0;
+
+        if (H5Dread_chunk2(dset, H5P_DEFAULT, origin, &fmask, raw, &rsize) < 0 || rsize != sizeof(raw))
+            TEST_ERROR;
+        raw[10] ^= 0xFF;
+        if (H5Dwrite_chunk(dset, H5P_DEFAULT, fmask, origin, rsize, raw) < 0)
+            TEST_ERROR;
+        H5E_BEGIN_TRY
+        {
+            ret = H5Dread(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, rbuf);
+        }
+        H5E_END_TRY
+        if (ret >= 0)
+            TEST_ERROR;
+    }
+    if (H5Dclose(dset) < 0)
+        TEST_ERROR;
+    dset = H5I_INVALID_HID;
+    PASSED();
+
+    /* ------------------------------------------------------------------ */
+    TESTING("filter dataset I/O: other filters run per unit (before: shuffle)");
+
+    memset(&g_dsetio, 0, sizeof(g_dsetio));
+    if ((dset = dsetio_create_dset(file, "before", 2)) < 0)
+        TEST_ERROR;
+    if (H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, wbuf) < 0)
+        TEST_ERROR;
+    {
+        const hsize_t origin[2] = {0, 0};
+        unsigned char raw[64 * sizeof(int)];
+        size_t        rsize = sizeof(raw);
+        uint32_t      fmask = 0;
+
+        /* The stored unit is the shuffled data, not the data */
+        if (H5Dread_chunk2(dset, H5P_DEFAULT, origin, &fmask, raw, &rsize) < 0 || rsize != sizeof(raw))
+            TEST_ERROR;
+        if (0 == memcmp(raw, wbuf, sizeof(raw)) || fmask != 0)
+            TEST_ERROR;
+    }
+    memset(rbuf, 0, sizeof(rbuf));
+    if (H5Dread(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, rbuf) < 0)
+        TEST_ERROR;
+    if (memcmp(wbuf, rbuf, sizeof(wbuf)) != 0 || g_dsetio.nwrite != 1 || g_dsetio.nread != 1 ||
+        g_dsetio.nchunk != 0)
         TEST_ERROR;
     if (H5Dclose(dset) < 0)
         TEST_ERROR;
     dset = H5I_INVALID_HID;
+    PASSED();
+
+    /* ------------------------------------------------------------------ */
+    TESTING("filter dataset I/O: not offered with two dataset-level filters");
+
+    memset(&g_dsetio, 0, sizeof(g_dsetio));
+    if ((dset = dsetio_create_dset(file, "twice", 3)) < 0)
+        TEST_ERROR;
+    if (H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, wbuf) < 0)
+        TEST_ERROR;
+    memset(rbuf, 0, sizeof(rbuf));
+    if (H5Dread(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, rbuf) < 0)
+        TEST_ERROR;
+    /* Per-chunk path: 2 entries x 4 chunks, written and read */
+    if (memcmp(wbuf, rbuf, sizeof(wbuf)) != 0 || g_dsetio.nwrite != 0 || g_dsetio.nread != 0 ||
+        g_dsetio.nchunk != 16)
+        TEST_ERROR;
+    /* H5Zapply_pipeline is refused outside a dataset-level callback */
+    {
+        size_t nb = 4, bs = 4;
+        void  *b = H5allocate_memory(bs, false);
+
+        H5E_BEGIN_TRY
+        {
+            ret = H5Zapply_pipeline(dset, H5Z_PIPELINE_AFTER, 0, H5P_DEFAULT, NULL, NULL, &nb, &bs, &b);
+        }
+        H5E_END_TRY
+        H5free_memory(b);
+        if (ret >= 0)
+            TEST_ERROR;
+    }
+    if (H5Dclose(dset) < 0)
+        TEST_ERROR;
+    dset = H5I_INVALID_HID;
+    PASSED();
+
+    /* ------------------------------------------------------------------ */
+    TESTING("filter dataset I/O: multi-dataset requests");
+
+    memset(&g_dsetio, 0, sizeof(g_dsetio));
+    {
+        static const hsize_t dims[2] = {8, 8};
+        hid_t                ds[3]   = {H5I_INVALID_HID, H5I_INVALID_HID, H5I_INVALID_HID};
+        hid_t                mt[3]   = {H5T_NATIVE_INT, H5T_NATIVE_INT, H5T_NATIVE_INT};
+        hid_t                ms[3], fs[3];
+        int                  w2[64], w3[64], r1[64], r2[64], r3[64];
+        const void          *wb[3] = {wbuf, w2, w3};
+        void                *rb[3] = {r1, r2, r3};
+
+        for (int i = 0; i < 64; i++) {
+            w2[i] = -i;
+            w3[i] = 1000 + i;
+        }
+        /* m1: handled by its filter; m2: no filter; m3: its filter declines
+         * (this test filter declines selections other than H5S_ALL) */
+        if ((ds[0] = dsetio_create_dset(file, "m1", 0)) < 0)
+            TEST_ERROR;
+        if ((sid = H5Screate_simple(2, dims, NULL)) < 0)
+            TEST_ERROR;
+        if ((ds[1] = H5Dcreate2(file, "m2", H5T_NATIVE_INT, sid, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT)) < 0)
+            TEST_ERROR;
+        if ((ds[2] = dsetio_create_dset(file, "m3", 0)) < 0)
+            TEST_ERROR;
+        ms[0] = fs[0] = H5S_ALL;
+        ms[1] = fs[1] = H5S_ALL;
+        ms[2] = fs[2] = sid;
+
+        if (H5Dwrite_multi(3, ds, mt, ms, fs, H5P_DEFAULT, wb) < 0)
+            TEST_ERROR;
+        /* m1 and m3 offered; m3's 4 chunks then went down the normal path
+         * together with m2 */
+        if (g_dsetio.nwrite != 2 || g_dsetio.nchunk != 4)
+            TEST_ERROR;
+        memset(r1, 0, sizeof(r1));
+        memset(r2, 0, sizeof(r2));
+        memset(r3, 0, sizeof(r3));
+        if (H5Dread_multi(3, ds, mt, ms, fs, H5P_DEFAULT, rb) < 0)
+            TEST_ERROR;
+        if (g_dsetio.nread != 2 || g_dsetio.nchunk != 8)
+            TEST_ERROR;
+        if (memcmp(r1, wbuf, sizeof(r1)) != 0 || memcmp(r2, w2, sizeof(r2)) != 0 ||
+            memcmp(r3, w3, sizeof(r3)) != 0)
+            TEST_ERROR;
+        /* m1 holds the one-unit layout only its filter produces */
+        if (H5Dget_storage_size(ds[0]) != 64 * sizeof(int) + 3 * sizeof(unsigned))
+            TEST_ERROR;
+
+        /* Every dataset handled: nothing is left for the normal path */
+        ms[2] = fs[2] = H5S_ALL;
+        {
+            hid_t       ds2[2] = {ds[0], ds[2]}, mt2[2] = {mt[0], mt[2]};
+            hid_t       ms2[2] = {H5S_ALL, H5S_ALL}, fs2[2] = {H5S_ALL, H5S_ALL};
+            const void *wb2[2] = {w3, wbuf};
+            void       *rb2[2] = {r1, r3};
+
+            if (H5Dwrite_multi(2, ds2, mt2, ms2, fs2, H5P_DEFAULT, wb2) < 0)
+                TEST_ERROR;
+            if (H5Dread_multi(2, ds2, mt2, ms2, fs2, H5P_DEFAULT, rb2) < 0)
+                TEST_ERROR;
+            if (memcmp(r1, w3, sizeof(r1)) != 0 || memcmp(r3, wbuf, sizeof(r3)) != 0 || g_dsetio.nchunk != 8)
+                TEST_ERROR;
+        }
+
+        for (int i = 0; i < 3; i++)
+            if (H5Dclose(ds[i]) < 0)
+                TEST_ERROR;
+        if (H5Sclose(sid) < 0)
+            TEST_ERROR;
+        sid = H5I_INVALID_HID;
+    }
     PASSED();
 
     if (H5Pclose(dxpl) < 0)

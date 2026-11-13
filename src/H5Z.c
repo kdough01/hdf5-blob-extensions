@@ -21,6 +21,7 @@
 #include "H5MMprivate.h" /* Memory management   */
 #include "H5Oprivate.h"  /* Object headers      */
 #include "H5Pprivate.h"  /* Property lists      */
+#include "H5VLprivate.h" /* Virtual Object Layer */
 #include "H5PLprivate.h" /* Plugins             */
 #include "H5Sprivate.h"  /* Dataspace functions */
 #include "H5Zpkg.h"      /* Data filters        */
@@ -652,6 +653,49 @@ H5Zunregister(H5Z_filter_t id)
 done:
     FUNC_LEAVE_API(ret_value)
 } /* end H5Zunregister() */
+
+/*-------------------------------------------------------------------------
+ * Function: H5Zapply_pipeline
+ *
+ * Purpose:  Runs the pipeline entries before or after the filter whose
+ *           dataset-level callback is running, on one buffer.  See
+ *           H5Zdevelop.h.
+ *
+ * Return:   Non-negative on success/Negative on failure
+ *-------------------------------------------------------------------------
+ */
+herr_t
+H5Zapply_pipeline(hid_t dset_id, H5Z_pipeline_part_t part, unsigned flags, hid_t dxpl_id,
+                  const hsize_t *scaled, unsigned *filter_mask, size_t *nbytes, size_t *buf_size, void **buf)
+{
+    H5VL_object_t *vol_obj;
+    H5D_t         *dset;
+    herr_t         ret_value = SUCCEED;
+
+    FUNC_ENTER_API(FAIL)
+
+    if (NULL == (vol_obj = (H5VL_object_t *)H5I_object_verify(dset_id, H5I_DATASET)))
+        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not a dataset ID");
+    if (NULL == (dset = (H5D_t *)H5VL_object_unwrap(vol_obj)))
+        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "can't get the dataset");
+    if (part != H5Z_PIPELINE_BEFORE && part != H5Z_PIPELINE_AFTER)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "invalid pipeline part");
+    if (flags & ~((unsigned)H5Z_FLAG_INVMASK))
+        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "invalid flags");
+    if (!nbytes || !buf_size || !buf || !*buf || *buf_size < *nbytes)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "invalid buffer");
+    if (H5P_DEFAULT == dxpl_id)
+        dxpl_id = H5P_DATASET_XFER_DEFAULT;
+    else if (true != H5P_isa_class(dxpl_id, H5P_DATASET_XFER))
+        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not a dataset transfer property list");
+
+    if (H5D_filter_dset_io_pipeline(dset, (unsigned)part, flags, dxpl_id, scaled, filter_mask, nbytes,
+                                    buf_size, buf) < 0)
+        HGOTO_ERROR(H5E_PLINE, H5E_CANTFILTER, FAIL, "can't apply filter pipeline");
+
+done:
+    FUNC_LEAVE_API(ret_value)
+} /* end H5Zapply_pipeline() */
 
 /*-------------------------------------------------------------------------
  * Function:    H5Z__unregister

@@ -577,6 +577,22 @@ typedef struct H5D_sieve_buf_t {
  * created once for a given dataset.  Thus, if a dataset is opened twice,
  * there will be two IDs and two H5D_t structs, both sharing one H5D_shared_t.
  */
+/* A chunk stored by a filter's dset_write callback under an MPI file driver.
+ * The callback's H5Dwrite_chunk() calls are held here and written by all
+ * ranks together when the callback returns (H5D__mpio_filter_dset_io_flush) */
+typedef struct H5D_dset_io_chunk_t {
+    hsize_t  scaled[H5O_LAYOUT_NDIMS]; /* Scaled coordinates of the chunk */
+    size_t   size;                     /* Stored size of the chunk, in bytes */
+    uint32_t filter_mask;              /* Filters skipped, as for H5Dwrite_chunk() */
+    void    *buf;                      /* Copy of the chunk's bytes */
+} H5D_dset_io_chunk_t;
+
+typedef struct H5D_dset_io_queue_t {
+    size_t               nused;  /* Number of chunks held */
+    size_t               nalloc; /* Allocated entries */
+    H5D_dset_io_chunk_t *chunk;  /* The chunks, in the order the callback wrote them */
+} H5D_dset_io_queue_t;
+
 struct H5D_shared_t {
     size_t           fo_count;              /* Reference count */
     bool             closing;               /* Flag to indicate dataset is closing */
@@ -591,9 +607,12 @@ struct H5D_shared_t {
     bool             checked_filters;       /* true if dataset passes can_apply check */
     /* Some pipeline entry is H5Z_STATE_PENDING: its class was not registered
      * at open, so its init (if any) runs in H5D__filter_state_ensure() */
-    bool filter_state_pending;
-    bool filter_state_load_tried; /* H5D__filter_state_ensure() has tried loading plugins */
-    bool filter_dset_io_active;   /* Inside the filter's dset_read/dset_write callback */
+    bool     filter_state_pending;
+    bool     filter_state_load_tried; /* H5D__filter_state_ensure() has tried loading plugins */
+    bool     filter_dset_io_active;   /* Inside the filter's dset_read/dset_write callback */
+    unsigned filter_dset_io_idx;      /* Pipeline index of that filter, valid while active */
+    struct H5D_dset_io_queue_t *filter_dset_io_queue; /* Chunks the callback wrote, held for a
+                                                       * collective write (MPI only); else NULL */
 
     /* Cached dataspace info */
     unsigned ndims;                       /* The dataset's dataspace rank */
@@ -728,6 +747,9 @@ H5_DLL herr_t H5D__filter_state_ensure(const H5D_t *dset);
  * offered or declined, do the normal I/O; negative: error. */
 H5_DLL htri_t H5D__filter_dset_io(H5D_t *dset, bool write_op, hid_t mem_type_id, hid_t mem_space_id,
                                   hid_t file_space_id, hid_t dxpl_id, H5_flexible_const_ptr_t buf);
+/* Hold one H5Dwrite_chunk() of a dset_write callback for the collective write (MPI only) */
+H5_DLL herr_t H5D__filter_dset_io_queue_chunk(H5D_t *dset, uint32_t filters, const hsize_t *scaled,
+                                              size_t data_size, const void *buf);
 
 /* Internal I/O routines */
 H5_DLL herr_t H5D__read(size_t count, H5D_dset_io_info_t *dset_info);
@@ -869,6 +891,11 @@ H5_DLL herr_t H5D__collective_write(H5D_io_info_t *io_info);
 H5_DLL htri_t H5D__mpio_opt_possible(H5D_io_info_t *io_info);
 H5_DLL herr_t H5D__mpio_get_no_coll_cause_strings(char *local_cause, size_t local_cause_len,
                                                   char *global_cause, size_t global_cause_len);
+
+/* Dataset-level filter callbacks under an MPI file driver: agree on one value
+ * across ranks, and write the chunks every rank's callback stored */
+H5_DLL herr_t H5D__mpio_filter_dset_io_agree(const H5D_t *dset, int local, int *min_out, int *max_out);
+H5_DLL herr_t H5D__mpio_filter_dset_io_flush(H5D_t *dset, const H5D_dset_io_queue_t *queue);
 
 #endif /* H5_HAVE_PARALLEL */
 

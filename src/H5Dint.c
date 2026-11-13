@@ -29,6 +29,7 @@
 #include "H5Iprivate.h"  /* IDs                                      */
 #include "H5Lprivate.h"  /* Links                                    */
 #include "H5MMprivate.h" /* Memory management                        */
+#include "H5Pprivate.h"  /* Property lists                           */
 #include "H5SLprivate.h" /* Skip Lists                               */
 #include "H5VLprivate.h" /* Virtual Object Layer                     */
 #include "H5VMprivate.h" /* Vector Functions                         */
@@ -3434,17 +3435,25 @@ done:
  * Function: H5D__filter_dset_io
  *
  * Purpose:  Offers one whole H5Dread()/H5Dwrite() request to the dataset's
- *           filter, when that filter's class defines the matching
- *           dataset-level callback (H5Z_class3_t dset_read / dset_write).
+ *           dataset-level filter: the one pipeline entry whose class
+ *           defines the matching callback (H5Z_class3_t dset_read /
+ *           dset_write).  The other entries of the pipeline, if any, are
+ *           the callback's to run, per compression unit, through
+ *           H5Zapply_pipeline().
  *
  *           Called before any I/O setup, so the application's buffer has
  *           not been touched and no chunk is locked: the callback is free
  *           to use H5Dwrite_chunk()/H5Dread_chunk() on the temporary
  *           dataset ID it is handed.
  *
- *           Offered only for a chunked dataset whose pipeline is that one
- *           filter (a callback that stores chunks itself would bypass any
- *           other entry), and never recursively.
+ *           Under an MPI file driver a write (and a collective read) is
+ *           offered on every rank or on none: the ranks agree first, and
+ *           afterwards agree on the outcome.  The chunks a write callback
+ *           stores with H5Dwrite_chunk() are held on each rank and written
+ *           by all ranks together once every callback has returned, the
+ *           way a collective write of filtered chunks is.
+ *
+ *           Never offered recursively.
  *
  * Return:   Positive if the filter performed the transfer, zero if the
  *           request was not offered or the filter declined it (the caller
@@ -3455,38 +3464,84 @@ htri_t
 H5D__filter_dset_io(H5D_t *dset, bool write_op, hid_t mem_type_id, hid_t mem_space_id, hid_t file_space_id,
                     hid_t dxpl_id, H5_flexible_const_ptr_t buf)
 {
-    H5D_shared_t  *shared    = dset->shared;
-    H5Z_entry_t   *entry     = NULL;            /* The filter's class */
-    H5VL_object_t *vol_obj   = NULL;            /* VOL object stored with the temporary ID */
-    hid_t          dset_id   = H5I_INVALID_HID; /* Temporary ID for the callback */
-    bool           active    = false;           /* This call set filter_dset_io_active */
-    htri_t         status    = 0;               /* Callback's return value */
-    htri_t         ret_value = false;
+    H5D_shared_t       *shared     = dset->shared;
+    const H5O_pline_t  *pline      = &shared->dcpl_cache.pline;
+    H5Z_entry_t        *entry      = NULL;            /* The dataset-level filter's class */
+    H5VL_object_t      *vol_obj    = NULL;            /* VOL object stored with the temporary ID */
+    hid_t               dset_id    = H5I_INVALID_HID; /* Temporary ID for the callback */
+    unsigned            idx        = 0;               /* Pipeline index of the dataset-level filter */
+    unsigned            nfound     = 0;               /* Entries defining the callback */
+    bool                local_ok   = true;            /* This rank's request can be offered */
+    bool                collective = false;           /* Ranks must agree (MPI) */
+    bool                active     = false;           /* This call set filter_dset_io_active */
+    H5D_dset_io_queue_t queue      = {0, 0, NULL};    /* Chunks held for the collective write */
+    htri_t              status     = 0;               /* Callback's return value */
+    htri_t              ret_value  = false;
 
     FUNC_ENTER_PACKAGE_TAG(dset->oloc.addr)
 
-    /* Requests that are never offered */
-    if (H5D_CHUNKED != shared->layout.type || 1 != shared->dcpl_cache.pline.nused ||
-        shared->filter_dset_io_active || H5S_BLOCK == mem_space_id || H5S_PLIST == file_space_id ||
+    /* Requests that are never offered (the same answer on every rank) */
+    if (H5D_CHUNKED != shared->layout.type || 0 == pline->nused || shared->filter_dset_io_active ||
         NULL == dset->oloc.file)
-        HGOTO_DONE(false);
-    if (H5F_HAS_FEATURE(dset->oloc.file, H5FD_FEAT_HAS_MPI))
         HGOTO_DONE(false);
     /* A write to a read-only file is reported by the normal path */
     if (write_op && 0 == (H5F_INTENT(dset->oloc.file) & H5F_ACC_RDWR))
         HGOTO_DONE(false);
 
-    /* Run init deferred from open (loading the plugin if need be), so the
-     * class and its state are available */
+    /* Run init deferred from open (loading plugins if need be), so the
+     * classes and their state are available */
     if (shared->filter_state_pending && H5D__filter_state_ensure(dset) < 0)
         HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "unable to initialize filter state");
 
-    if (H5Z_find_entry(true, shared->dcpl_cache.pline.filter[0].id, &entry) < 0)
-        HGOTO_ERROR(H5E_PLINE, H5E_CANTGET, FAIL, "can't look up filter class");
-    if (NULL == entry || (write_op ? NULL == entry->dset_write : NULL == entry->dset_read))
+    /* Exactly one entry may define the callback; it runs the others */
+    for (unsigned u = 0; u < pline->nused; u++) {
+        H5Z_entry_t *e = NULL;
+
+        if (H5Z_find_entry(true, pline->filter[u].id, &e) < 0)
+            HGOTO_ERROR(H5E_PLINE, H5E_CANTGET, FAIL, "can't look up filter class");
+        if (e && (write_op ? NULL != e->dset_write : NULL != e->dset_read)) {
+            entry = e;
+            idx   = u;
+            nfound++;
+        }
+    }
+    if (1 != nfound)
         HGOTO_DONE(false);
     /* Without its state the filter cannot run; the normal path reports why */
-    if (entry->init && shared->dcpl_cache.pline.filter[0].state_status != H5Z_STATE_READY)
+    if (entry->init && pline->filter[idx].state_status != H5Z_STATE_READY)
+        HGOTO_DONE(false);
+
+    /* Requests whose answer can differ between ranks */
+    if (H5S_BLOCK == mem_space_id || H5S_PLIST == file_space_id)
+        local_ok = false;
+
+#ifdef H5_HAVE_PARALLEL
+    if (H5F_HAS_FEATURE(dset->oloc.file, H5FD_FEAT_HAS_MPI)) {
+        H5P_genplist_t  *plist;
+        H5FD_mpio_xfer_t xfer_mode = H5FD_MPIO_INDEPENDENT;
+
+        if (NULL == (plist = H5P_object_verify(dxpl_id, H5P_DATASET_XFER, true)))
+            HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not a dataset transfer property list");
+        if (H5P_get(plist, H5D_XFER_IO_XFER_MODE_NAME, &xfer_mode) < 0)
+            HGOTO_ERROR(H5E_PLIST, H5E_CANTGET, FAIL, "can't get transfer mode");
+        collective = (H5FD_MPIO_COLLECTIVE == xfer_mode);
+
+        /* Storing chunks changes the chunk index and file space, which every
+         * rank must do together: a write is offered only collectively, as a
+         * write to a filtered dataset under MPI must be */
+        if (write_op && !collective)
+            HGOTO_DONE(false);
+
+        if (collective) {
+            int min_ok, max_ok;
+
+            if (H5D__mpio_filter_dset_io_agree(dset, local_ok ? 1 : 0, &min_ok, &max_ok) < 0)
+                HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't agree on offering the request");
+            local_ok = (1 == min_ok);
+        }
+    }
+#endif /* H5_HAVE_PARALLEL */
+    if (!local_ok)
         HGOTO_DONE(false);
 
     /* A temporary ID for the callback; removed again below without closing
@@ -3495,10 +3550,13 @@ H5D__filter_dset_io(H5D_t *dset, bool write_op, hid_t mem_type_id, hid_t mem_spa
         HGOTO_ERROR(H5E_DATASET, H5E_CANTREGISTER, FAIL, "can't register (temporary) dataset ID");
 
     shared->filter_dset_io_active = active = true;
+    shared->filter_dset_io_idx             = idx;
+    if (collective && write_op)
+        shared->filter_dset_io_queue = &queue;
 
     H5_BEFORE_USER_CB(FAIL)
         {
-            void *fstate = shared->dcpl_cache.pline.filter[0].state;
+            void *fstate = pline->filter[idx].state;
 
             if (write_op)
                 status = (entry->dset_write)(fstate, dset_id, mem_type_id, mem_space_id, file_space_id,
@@ -3509,6 +3567,39 @@ H5D__filter_dset_io(H5D_t *dset, bool write_op, hid_t mem_type_id, hid_t mem_spa
         }
     H5_AFTER_USER_CB(FAIL)
 
+    shared->filter_dset_io_queue = NULL;
+
+#ifdef H5_HAVE_PARALLEL
+    if (collective) {
+        int local = (status < 0) ? -1 : (status > 0) ? 1 : 0;
+        int min_status, max_status;
+
+        /* Every rank reaches this point, so a failure on one rank fails the
+         * request on all of them instead of leaving the others waiting */
+        if (H5D__mpio_filter_dset_io_agree(dset, local, &min_status, &max_status) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't agree on the callback's outcome");
+        if (min_status < 0)
+            HGOTO_ERROR(H5E_PLINE, write_op ? H5E_WRITEERROR : H5E_READERROR, FAIL,
+                        "dataset-level callback of filter %d failed on %s", (int)entry->base.id,
+                        status < 0 ? "this rank" : "another rank");
+        if (min_status != max_status)
+            HGOTO_ERROR(H5E_PLINE, write_op ? H5E_WRITEERROR : H5E_READERROR, FAIL,
+                        "dataset-level callback of filter %d handled the request on some ranks and "
+                        "declined it on others",
+                        (int)entry->base.id);
+        if (0 == max_status && queue.nused > 0)
+            HGOTO_ERROR(H5E_PLINE, H5E_WRITEERROR, FAIL,
+                        "dataset-level callback of filter %d stored chunks and then declined",
+                        (int)entry->base.id);
+
+        /* Write what every rank's callback stored, all ranks together */
+        if (write_op && max_status > 0 && H5D__mpio_filter_dset_io_flush(dset, &queue) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "can't write the chunks the filter stored");
+
+        status = max_status;
+    }
+#endif /* H5_HAVE_PARALLEL */
+
     if (status < 0)
         HGOTO_ERROR(H5E_PLINE, write_op ? H5E_WRITEERROR : H5E_READERROR, FAIL,
                     "dataset-level callback of filter %d failed", (int)entry->base.id);
@@ -3518,6 +3609,11 @@ H5D__filter_dset_io(H5D_t *dset, bool write_op, hid_t mem_type_id, hid_t mem_spa
 done:
     if (active)
         shared->filter_dset_io_active = false;
+    shared->filter_dset_io_queue = NULL;
+
+    for (size_t u = 0; u < queue.nused; u++)
+        H5MM_xfree(queue.chunk[u].buf);
+    H5MM_xfree(queue.chunk);
 
     /* Discard the temporary identifier, leaving the dataset open */
     if (dset_id != H5I_INVALID_HID) {
@@ -3534,6 +3630,130 @@ done:
 
     FUNC_LEAVE_NOAPI_TAG(ret_value)
 } /* end H5D__filter_dset_io() */
+
+/*-------------------------------------------------------------------------
+ * Function: H5D__filter_dset_io_queue_chunk
+ *
+ * Purpose:  Holds one chunk that a dataset-level write callback stores with
+ *           H5Dwrite_chunk() under an MPI file driver.  Allocating file
+ *           space and updating the chunk index must be done by all ranks
+ *           together, so the chunk is written when every rank's callback
+ *           has returned (H5D__mpio_filter_dset_io_flush()).
+ *
+ * Return:   Non-negative on success/Negative on failure
+ *-------------------------------------------------------------------------
+ */
+herr_t
+H5D__filter_dset_io_queue_chunk(H5D_t *dset, uint32_t filters, const hsize_t *scaled, size_t data_size,
+                                const void *buf)
+{
+    H5D_dset_io_queue_t *queue = dset->shared->filter_dset_io_queue;
+    H5D_dset_io_chunk_t *ent;
+    herr_t               ret_value = SUCCEED;
+
+    FUNC_ENTER_PACKAGE
+
+    assert(queue);
+
+    /* A later write of the same chunk replaces the earlier one */
+    for (size_t u = 0; u < queue->nused; u++)
+        if (0 == memcmp(queue->chunk[u].scaled, scaled, dset->shared->ndims * sizeof(hsize_t))) {
+            H5MM_xfree(queue->chunk[u].buf);
+            memmove(&queue->chunk[u], &queue->chunk[u + 1], (queue->nused - u - 1) * sizeof(*queue->chunk));
+            queue->nused--;
+            break;
+        }
+
+    if (queue->nused == queue->nalloc) {
+        size_t               n = queue->nalloc ? 2 * queue->nalloc : 16;
+        H5D_dset_io_chunk_t *p;
+
+        if (NULL == (p = (H5D_dset_io_chunk_t *)H5MM_realloc(queue->chunk, n * sizeof(*p))))
+            HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, FAIL, "can't grow the list of stored chunks");
+        queue->chunk  = p;
+        queue->nalloc = n;
+    }
+
+    ent = &queue->chunk[queue->nused];
+    memset(ent, 0, sizeof(*ent));
+    memcpy(ent->scaled, scaled, dset->shared->ndims * sizeof(hsize_t));
+    ent->size        = data_size;
+    ent->filter_mask = filters;
+    if (NULL == (ent->buf = H5MM_malloc(data_size ? data_size : 1)))
+        HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, FAIL, "can't hold the chunk's bytes");
+    H5MM_memcpy(ent->buf, buf, data_size);
+    queue->nused++;
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* end H5D__filter_dset_io_queue_chunk() */
+
+/*-------------------------------------------------------------------------
+ * Function: H5D_filter_dset_io_pipeline
+ *
+ * Purpose:  Runs the pipeline entries before (H5Z_PIPELINE_BEFORE) or after
+ *           (H5Z_PIPELINE_AFTER) the dataset-level filter whose callback is
+ *           running, on one buffer, forward or (H5Z_FLAG_REVERSE) in
+ *           reverse.  The callback calls it once per compression unit, so
+ *           the whole pipeline runs per unit.
+ *
+ *           FILTER_MASK uses the pipeline's own bit numbering: on input,
+ *           entries to skip; on output, the bits of the entries in the range
+ *           that were skipped (an optional filter that failed).  Bits outside
+ *           the range are not changed.
+ *
+ * Return:   Non-negative on success/Negative on failure
+ *-------------------------------------------------------------------------
+ */
+herr_t
+H5D_filter_dset_io_pipeline(H5D_t *dset, unsigned part, unsigned flags, hid_t dxpl_id, const hsize_t *scaled,
+                            unsigned *filter_mask, size_t *nbytes, size_t *buf_size, void **buf)
+{
+    const H5O_pline_t *pline;
+    unsigned           lo, hi;
+    unsigned           range = 0; /* Bits of the entries to run */
+    unsigned           mask;
+    H5Z_cb_t           cb_struct = {NULL, NULL};
+    herr_t             ret_value = SUCCEED;
+
+    FUNC_ENTER_NOAPI_TAG(dset->oloc.addr, FAIL)
+
+    if (!dset->shared->filter_dset_io_active)
+        HGOTO_ERROR(H5E_PLINE, H5E_BADVALUE, FAIL,
+                    "only valid within a dataset-level filter callback for this dataset");
+
+    pline = &dset->shared->dcpl_cache.pline;
+    if (H5Z_PIPELINE_BEFORE == part) {
+        lo = 0;
+        hi = dset->shared->filter_dset_io_idx;
+    }
+    else if (H5Z_PIPELINE_AFTER == part) {
+        lo = dset->shared->filter_dset_io_idx + 1;
+        hi = (unsigned)pline->nused;
+    }
+    else
+        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "invalid pipeline part");
+
+    for (unsigned u = lo; u < hi; u++)
+        range |= (unsigned)1 << u;
+    if (0 == range)
+        HGOTO_DONE(SUCCEED); /* Nothing on that side of the filter */
+    if (0 == *nbytes)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "no data to filter");
+
+    /* Run the whole pipeline with every entry outside the range excluded */
+    mask = ~range | (filter_mask ? *filter_mask : 0);
+    if (H5Z_pipeline(pline, flags, dxpl_id, scaled, (size_t)dset->shared->ndims, &mask, H5Z_ENABLE_EDC,
+                     cb_struct, nbytes, buf_size, buf) < 0)
+        HGOTO_ERROR(H5E_PLINE, (flags & H5Z_FLAG_REVERSE) ? H5E_READERROR : H5E_WRITEERROR, FAIL,
+                    "filter pipeline failed");
+
+    if (filter_mask)
+        *filter_mask = (*filter_mask & ~range) | (mask & range);
+
+done:
+    FUNC_LEAVE_NOAPI_TAG(ret_value)
+} /* end H5D_filter_dset_io_pipeline() */
 
 /*-------------------------------------------------------------------------
  * Function: H5D__format_convert

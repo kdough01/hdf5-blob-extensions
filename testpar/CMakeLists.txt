@@ -215,6 +215,7 @@ set (H5P_TESTS
     t_select_io_dset
     t_shapesame
     t_filters_parallel
+    t_filter_dset_io
     t_subfiling_vfd
     t_2Gio
     t_vfd

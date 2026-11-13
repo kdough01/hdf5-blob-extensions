@@ -56,6 +56,10 @@ static herr_t H5VL__native_dataset_io_setup(size_t count, void *obj[], hid_t mem
                                             H5_flexible_const_ptr_t buf[], H5D_dset_io_info_t *dinfo);
 static herr_t H5VL__native_dataset_io_cleanup(size_t count, hid_t mem_space_id[], hid_t file_space_id[],
                                               H5D_dset_io_info_t *dinfo);
+static herr_t H5VL__native_dataset_io_offer(bool write_op, size_t count, hid_t mem_type_id[],
+                                            hid_t mem_space_id[], hid_t file_space_id[], hid_t dxpl_id,
+                                            H5D_dset_io_info_t *dinfo, H5D_dset_io_info_t **rest,
+                                            size_t *nrest);
 
 /*********************/
 /* Package Variables */
@@ -240,6 +244,67 @@ H5VL__native_dataset_io_cleanup(size_t count, hid_t mem_space_id[], hid_t file_s
 } /* end H5VL__native_dataset_io_cleanup() */
 
 /*-------------------------------------------------------------------------
+ * Function:    H5VL__native_dataset_io_offer
+ *
+ * Purpose:     Offers each dataset of a read or write request to its
+ *              dataset-level filter (H5D__filter_dset_io).  On return *REST
+ *              holds the *NREST datasets the filters did not handle, for the
+ *              normal I/O path: DINFO itself when none was handled, else a
+ *              new array the caller frees.
+ *
+ * Return:      SUCCEED/FAIL
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__native_dataset_io_offer(bool write_op, size_t count, hid_t mem_type_id[], hid_t mem_space_id[],
+                              hid_t file_space_id[], hid_t dxpl_id, H5D_dset_io_info_t *dinfo,
+                              H5D_dset_io_info_t **rest, size_t *nrest)
+{
+    H5D_dset_io_info_t *left      = NULL; /* Datasets not handled, once one has been */
+    size_t              nleft     = 0;
+    herr_t              ret_value = SUCCEED;
+
+    FUNC_ENTER_PACKAGE
+
+    for (size_t i = 0; i < count; i++) {
+        htri_t handled;
+
+        if ((handled = H5D__filter_dset_io(dinfo[i].dset, write_op, mem_type_id[i], mem_space_id[i],
+                                           file_space_id[i], dxpl_id, dinfo[i].buf)) < 0)
+            HGOTO_ERROR(H5E_DATASET, write_op ? H5E_WRITEERROR : H5E_READERROR, FAIL,
+                        "filter's dataset-level %s failed", write_op ? "write" : "read");
+
+        if (handled) {
+            /* First handled dataset: keep the ones before it */
+            if (NULL == left) {
+                if (NULL == (left = (H5D_dset_io_info_t *)H5MM_malloc(count * sizeof(H5D_dset_io_info_t))))
+                    HGOTO_ERROR(H5E_DATASET, H5E_CANTALLOC, FAIL, "couldn't allocate dset info array");
+                if (i)
+                    H5MM_memcpy(left, dinfo, i * sizeof(H5D_dset_io_info_t));
+                nleft = i;
+            }
+        }
+        else if (left)
+            left[nleft++] = dinfo[i];
+    }
+
+    if (left) {
+        *rest  = left;
+        *nrest = nleft;
+        left   = NULL;
+    }
+    else {
+        *rest  = dinfo;
+        *nrest = count;
+    }
+
+done:
+    H5MM_xfree(left);
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* end H5VL__native_dataset_io_offer() */
+
+/*-------------------------------------------------------------------------
  * Function:    H5VL__native_dataset_create
  *
  * Purpose:     Handles the dataset create callback
@@ -352,6 +417,8 @@ H5VL__native_dataset_read(size_t count, void *obj[], hid_t mem_type_id[], hid_t 
 {
     H5D_dset_io_info_t  dinfo_local;
     H5D_dset_io_info_t *dinfo     = &dinfo_local;
+    H5D_dset_io_info_t *rest      = NULL; /* Datasets left for the normal path */
+    size_t              nrest     = 0;
     herr_t              ret_value = SUCCEED; /* Return value */
 
     FUNC_ENTER_PACKAGE
@@ -366,22 +433,18 @@ H5VL__native_dataset_read(size_t count, void *obj[], hid_t mem_type_id[], hid_t 
                                       (H5_flexible_const_ptr_t *)buf, dinfo) < 0)
         HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "unable to set up file and memory dataspaces");
 
-    /* Offer a single-dataset request to the dataset's filter first */
-    if (1 == count) {
-        htri_t handled;
-
-        if ((handled = H5D__filter_dset_io(dinfo[0].dset, false, mem_type_id[0], mem_space_id[0],
-                                           file_space_id[0], dxpl_id, dinfo[0].buf)) < 0)
-            HGOTO_ERROR(H5E_DATASET, H5E_READERROR, FAIL, "filter's dataset-level read failed");
-        if (handled)
-            HGOTO_DONE(SUCCEED);
-    }
+    /* Offer each dataset to its dataset-level filter first */
+    if (H5VL__native_dataset_io_offer(false, count, mem_type_id, mem_space_id, file_space_id, dxpl_id, dinfo,
+                                      &rest, &nrest) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_READERROR, FAIL, "filter's dataset-level read failed");
+    if (0 == nrest)
+        HGOTO_DONE(SUCCEED);
 
     /* Set DXPL for operation */
     H5CX_set_dxpl(dxpl_id);
 
     /* Read raw data.  Call H5D__read directly in single dset case. */
-    if (H5D__read(count, dinfo) < 0)
+    if (H5D__read(nrest, rest) < 0)
         HGOTO_ERROR(H5E_DATASET, H5E_READERROR, FAIL, "can't read data");
 
 done:
@@ -389,6 +452,8 @@ done:
     if (H5VL__native_dataset_io_cleanup(count, mem_space_id, file_space_id, dinfo) < 0)
         HDONE_ERROR(H5E_DATASET, H5E_CANTRELEASE, FAIL, "unable to release dataset info");
 
+    if (rest && rest != dinfo)
+        H5MM_xfree(rest);
     if (dinfo != &dinfo_local)
         H5MM_xfree(dinfo);
 
@@ -410,6 +475,8 @@ H5VL__native_dataset_write(size_t count, void *obj[], hid_t mem_type_id[], hid_t
 {
     H5D_dset_io_info_t  dinfo_local;
     H5D_dset_io_info_t *dinfo     = &dinfo_local;
+    H5D_dset_io_info_t *rest      = NULL; /* Datasets left for the normal path */
+    size_t              nrest     = 0;
     herr_t              ret_value = SUCCEED; /* Return value */
 
     FUNC_ENTER_PACKAGE
@@ -424,22 +491,18 @@ H5VL__native_dataset_write(size_t count, void *obj[], hid_t mem_type_id[], hid_t
                                       (H5_flexible_const_ptr_t *)buf, dinfo) < 0)
         HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "unable to set up file and memory dataspaces");
 
-    /* Offer a single-dataset request to the dataset's filter first */
-    if (1 == count) {
-        htri_t handled;
-
-        if ((handled = H5D__filter_dset_io(dinfo[0].dset, true, mem_type_id[0], mem_space_id[0],
-                                           file_space_id[0], dxpl_id, dinfo[0].buf)) < 0)
-            HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "filter's dataset-level write failed");
-        if (handled)
-            HGOTO_DONE(SUCCEED);
-    }
+    /* Offer each dataset to its dataset-level filter first */
+    if (H5VL__native_dataset_io_offer(true, count, mem_type_id, mem_space_id, file_space_id, dxpl_id, dinfo,
+                                      &rest, &nrest) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "filter's dataset-level write failed");
+    if (0 == nrest)
+        HGOTO_DONE(SUCCEED);
 
     /* Set DXPL for operation */
     H5CX_set_dxpl(dxpl_id);
 
     /* Write raw data.  Call H5D__write directly in single dset case. */
-    if (H5D__write(count, dinfo) < 0)
+    if (H5D__write(nrest, rest) < 0)
         HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "can't write data");
 
 done:
@@ -447,6 +510,8 @@ done:
     if (H5VL__native_dataset_io_cleanup(count, mem_space_id, file_space_id, dinfo) < 0)
         HDONE_ERROR(H5E_DATASET, H5E_CANTRELEASE, FAIL, "unable to release dataset info");
 
+    if (rest && rest != dinfo)
+        H5MM_xfree(rest);
     if (dinfo != &dinfo_local)
         H5MM_xfree(dinfo);
 

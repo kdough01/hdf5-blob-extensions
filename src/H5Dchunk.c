@@ -423,6 +423,16 @@ H5D__chunk_direct_write(H5D_t *dset, uint32_t filters, hsize_t *offset, size_t d
     /* Sanity checks */
     assert(layout->type == H5D_CHUNKED);
 
+    /* Inside a dataset-level filter callback under an MPI file driver, the
+     * chunk is held and written by all ranks together when it returns */
+    if (dset->shared->filter_dset_io_queue) {
+        H5VM_chunk_scaled(dset->shared->ndims, offset, layout->u.chunk.dim, scaled);
+        scaled[dset->shared->ndims] = 0;
+        if (H5D__filter_dset_io_queue_chunk(dset, filters, scaled, data_size, buf) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTALLOC, FAIL, "unable to hold chunk for collective write");
+        HGOTO_DONE(SUCCEED);
+    }
+
     /* Allocate dataspace and initialize it if it hasn't been. */
     if (!H5D__chunk_is_space_alloc(&layout->storage))
         if (H5D__alloc_storage(dset, H5D_ALLOC_WRITE, false, NULL) < 0)
@@ -505,6 +515,215 @@ H5D__chunk_direct_write(H5D_t *dset, uint32_t filters, hsize_t *offset, size_t d
 done:
     FUNC_LEAVE_NOAPI_TAG(ret_value)
 } /* end H5D__chunk_direct_write() */
+
+#ifdef H5_HAVE_PARALLEL
+/* One chunk stored by some rank's dataset-level callback, as exchanged */
+typedef struct H5D_dset_io_rec_t {
+    hsize_t  scaled[H5O_LAYOUT_NDIMS];
+    hsize_t  size;
+    uint32_t filter_mask;
+    uint32_t pad;
+} H5D_dset_io_rec_t;
+
+static int
+H5D__dset_io_rec_cmp(const void *a, const void *b)
+{
+    return memcmp(((const H5D_dset_io_rec_t *)a)->scaled, ((const H5D_dset_io_rec_t *)b)->scaled,
+                  sizeof(((const H5D_dset_io_rec_t *)a)->scaled));
+}
+
+/*-------------------------------------------------------------------------
+ * Function:    H5D__mpio_filter_dset_io_agree
+ *
+ * Purpose:     Minimum and maximum of LOCAL over the file's ranks
+ *
+ * Return:      Non-negative on success/Negative on failure
+ *-------------------------------------------------------------------------
+ */
+herr_t
+H5D__mpio_filter_dset_io_agree(const H5D_t *dset, int local, int *min_out, int *max_out)
+{
+    MPI_Comm comm;
+    int      in[2], out[2];
+    int      mpi_code;
+    herr_t   ret_value = SUCCEED;
+
+    FUNC_ENTER_PACKAGE
+
+    if (MPI_COMM_NULL == (comm = H5F_mpi_get_comm(dset->oloc.file)))
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get MPI communicator");
+
+    in[0] = local;
+    in[1] = -local;
+    if (MPI_SUCCESS != (mpi_code = MPI_Allreduce(in, out, 2, MPI_INT, MPI_MIN, comm)))
+        HMPI_GOTO_ERROR(FAIL, "MPI_Allreduce failed", mpi_code)
+    *min_out = out[0];
+    *max_out = -out[1];
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* end H5D__mpio_filter_dset_io_agree() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5D__mpio_filter_dset_io_flush
+ *
+ * Purpose:     Writes the chunks every rank's dataset-level write callback
+ *              stored, all ranks together.  As in a collective write of
+ *              filtered chunks (H5D__mpio_collective_filtered_chunk_reallocate
+ *              and _reinsert), every rank learns every chunk's new size,
+ *              allocates file space for all of them and inserts all of them
+ *              into the chunk index, in the same order, so the metadata stays
+ *              identical on every rank; each rank then writes only the bytes
+ *              of its own chunks.
+ *
+ * Return:      Non-negative on success/Negative on failure
+ *-------------------------------------------------------------------------
+ */
+herr_t
+H5D__mpio_filter_dset_io_flush(H5D_t *dset, const H5D_dset_io_queue_t *queue)
+{
+    const H5O_layout_t *layout = &(dset->shared->layout);
+    H5D_chk_idx_info_t  idx_info;
+    H5D_dset_io_rec_t  *mine   = NULL; /* This rank's chunks */
+    H5D_dset_io_rec_t  *all    = NULL; /* Every rank's chunks, in rank order */
+    H5D_dset_io_rec_t  *sorted = NULL; /* Copy, to find a chunk stored twice */
+    int                *counts = NULL; /* Per rank: chunks, then bytes, then byte displacements */
+    MPI_Comm            comm;
+    int                 mpi_rank, mpi_size, mpi_code;
+    int                 nlocal;
+    size_t              ntotal    = 0;
+    size_t              rec       = sizeof(H5D_dset_io_rec_t);
+    herr_t              ret_value = SUCCEED;
+
+    FUNC_ENTER_PACKAGE_TAG(dset->oloc.addr)
+
+    if (MPI_COMM_NULL == (comm = H5F_mpi_get_comm(dset->oloc.file)))
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get MPI communicator");
+    if ((mpi_rank = H5F_mpi_get_rank(dset->oloc.file)) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get MPI rank");
+    if ((mpi_size = H5F_mpi_get_size(dset->oloc.file)) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get MPI size");
+
+    /* Describe this rank's chunks */
+    H5_CHECKED_ASSIGN(nlocal, int, queue->nused, size_t);
+    if (NULL == (mine = (H5D_dset_io_rec_t *)H5MM_calloc((queue->nused ? queue->nused : 1) * rec)))
+        HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, FAIL, "can't allocate chunk list");
+    for (size_t u = 0; u < queue->nused; u++) {
+        memcpy(mine[u].scaled, queue->chunk[u].scaled, sizeof(mine[u].scaled));
+        mine[u].size        = (hsize_t)queue->chunk[u].size;
+        mine[u].filter_mask = queue->chunk[u].filter_mask;
+    }
+
+    /* Share them with every rank */
+    if (NULL == (counts = (int *)H5MM_malloc(3 * (size_t)mpi_size * sizeof(int))))
+        HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, FAIL, "can't allocate counts");
+    if (MPI_SUCCESS != (mpi_code = MPI_Allgather(&nlocal, 1, MPI_INT, counts, 1, MPI_INT, comm)))
+        HMPI_GOTO_ERROR(FAIL, "MPI_Allgather failed", mpi_code)
+    for (int r = 0; r < mpi_size; r++) {
+        size_t bytes = (size_t)counts[r] * rec;
+
+        H5_CHECKED_ASSIGN(counts[mpi_size + r], int, bytes, size_t);
+        counts[2 * mpi_size + r] = r ? counts[2 * mpi_size + r - 1] + counts[mpi_size + r - 1] : 0;
+        ntotal += (size_t)counts[r];
+    }
+    if (NULL == (all = (H5D_dset_io_rec_t *)H5MM_malloc((ntotal ? ntotal : 1) * rec)))
+        HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, FAIL, "can't allocate chunk list");
+    if (MPI_SUCCESS != (mpi_code = MPI_Allgatherv(mine, nlocal * (int)rec, MPI_BYTE, all, &counts[mpi_size],
+                                                  &counts[2 * mpi_size], MPI_BYTE, comm)))
+        HMPI_GOTO_ERROR(FAIL, "MPI_Allgatherv failed", mpi_code)
+
+    /* A chunk stored by two ranks would depend on rank order: refuse it, on
+     * every rank alike since every rank sees the same list */
+    if (ntotal > 1) {
+        if (NULL == (sorted = (H5D_dset_io_rec_t *)H5MM_malloc(ntotal * rec)))
+            HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, FAIL, "can't allocate chunk list");
+        H5MM_memcpy(sorted, all, ntotal * rec);
+        qsort(sorted, ntotal, rec, H5D__dset_io_rec_cmp);
+        for (size_t u = 1; u < ntotal; u++)
+            if (0 == H5D__dset_io_rec_cmp(&sorted[u - 1], &sorted[u]))
+                HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL,
+                            "two ranks stored the same chunk in one dataset-level write");
+    }
+
+    /* Allocate storage if it hasn't been (every rank does) */
+    if (!H5D__chunk_is_space_alloc(&layout->storage))
+        if (H5D__alloc_storage(dset, H5D_ALLOC_WRITE, false, NULL) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "unable to initialize storage");
+
+    idx_info.f      = dset->oloc.file;
+    idx_info.pline  = &(dset->shared->dcpl_cache.pline);
+    idx_info.layout = &(dset->shared->layout);
+
+    /* Every rank: allocate file space for every chunk and insert it into the
+     * index, in rank order; the owning rank also writes the bytes */
+    {
+        int    owner = 0; /* Rank that stored all[u] */
+        size_t left  = 0; /* all[] entries left for that rank */
+        size_t local = 0; /* Next of this rank's own chunks */
+
+        for (size_t u = 0; u < ntotal; u++) {
+            H5D_chunk_ud_t udata;
+            H5F_block_t    old_chunk;
+            bool           need_insert = false;
+            hsize_t        scaled[H5O_LAYOUT_NDIMS];
+
+            while (0 == left && owner < mpi_size) {
+                left = (size_t)counts[owner];
+                if (0 == left)
+                    owner++;
+            }
+
+            memcpy(scaled, all[u].scaled, sizeof(scaled));
+            scaled[dset->shared->ndims] = 0;
+
+            if (H5D__chunk_lookup(dset, scaled, &udata) < 0)
+                HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "error looking up chunk address");
+            old_chunk.offset         = udata.chunk_block.offset;
+            old_chunk.length         = udata.chunk_block.length;
+            udata.chunk_block.length = all[u].size;
+
+            if (H5D__chunk_file_alloc(&idx_info, &old_chunk, &udata.chunk_block, &need_insert, scaled) < 0)
+                HGOTO_ERROR(H5E_DATASET, H5E_CANTALLOC, FAIL, "unable to allocate chunk");
+            H5D__chunk_cinfo_cache_update(&dset->shared->cache.chunk.last, &udata);
+            if (!H5_addr_defined(udata.chunk_block.offset))
+                HGOTO_ERROR(H5E_DATASET, H5E_BADVALUE, FAIL, "chunk address isn't defined");
+
+            /* Drop a cached copy of the chunk, without flushing it */
+            if (UINT_MAX != udata.idx_hint)
+                if (H5D__chunk_cache_evict(dset, dset->shared->cache.chunk.slot[udata.idx_hint], false) < 0)
+                    HGOTO_ERROR(H5E_DATASET, H5E_CANTREMOVE, FAIL, "unable to evict chunk");
+
+            /* The owner writes the bytes, independently of the other ranks */
+            if (owner == mpi_rank) {
+                if (H5F_shared_block_write(H5F_SHARED(dset->oloc.file), H5FD_MEM_DRAW,
+                                           udata.chunk_block.offset, queue->chunk[local].size,
+                                           queue->chunk[local].buf) < 0)
+                    HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "unable to write raw data to file");
+                local++;
+            }
+
+            if (need_insert && layout->storage.u.chunk.ops->insert) {
+                udata.filter_mask = all[u].filter_mask;
+                if ((layout->storage.u.chunk.ops->insert)(&idx_info, &udata, dset) < 0)
+                    HGOTO_ERROR(H5E_DATASET, H5E_CANTINSERT, FAIL, "unable to insert chunk addr into index");
+            }
+
+            left--;
+            if (0 == left)
+                owner++;
+        }
+        assert(local == queue->nused);
+    }
+
+done:
+    H5MM_xfree(mine);
+    H5MM_xfree(all);
+    H5MM_xfree(sorted);
+    H5MM_xfree(counts);
+
+    FUNC_LEAVE_NOAPI_TAG(ret_value)
+} /* end H5D__mpio_filter_dset_io_flush() */
+#endif /* H5_HAVE_PARALLEL */
 
 /*-------------------------------------------------------------------------
  * Function:    H5D__chunk_direct_read

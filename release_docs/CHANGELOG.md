@@ -190,6 +190,19 @@ We would like to thank the many HDF5 community members who contributed to this r
    what one read decodes (a region, a reduced fidelity) per transfer -- with
    no change to the file format.
 
+   The pipeline may hold other filters besides the one defining the
+   callbacks: the callback runs them once per compression unit with the new
+   `H5Zapply_pipeline()` (those before it on the unit's data, those after it
+   on the compressed stream, and the reverse on read), so for a unit of one
+   chunk the stored bytes are exactly those of the per-chunk pipeline.  Each
+   dataset of an `H5Dwrite_multi` / `H5Dread_multi` is offered to its own
+   filter, and the datasets not handled go through the normal path together.
+   Under an MPI file driver a write is offered with collective transfer only,
+   on every rank or on none; the chunks each rank's callback stores with
+   `H5Dwrite_chunk` are held and written by all ranks together after every
+   callback has returned, with file space and the chunk index updated
+   collectively as for a collective write of filtered chunks.
+
    **TOML subset parser:**  The [tomlc17](https://github.com/cktan/tomlc17)
    library is now vendored in `src/tomlc17/` and compiled unconditionally into
    libhdf5.  Hex-float literals (`0x1.8p+1`) in parameter strings are

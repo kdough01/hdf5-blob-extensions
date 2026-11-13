@@ -528,13 +528,29 @@ typedef herr_t (*H5Z_term_func_t)(void *state);
  *          filter stores this way still lives in the dataset's own chunks, so
  *          the file format, the chunk index and H5Ocopy() are unaffected.
  *
- *          The request is offered only for a chunked dataset whose pipeline
- *          consists of this one filter, only for single-dataset requests
- *          (not H5Dwrite_multi() with more than one dataset), never with
- *          #H5S_BLOCK or #H5S_PLIST selections, and never in a file opened
- *          with an MPI file driver. It is not offered recursively: an
+ *          The request is offered only for a chunked dataset in whose
+ *          pipeline this is the one filter defining the callback, never with
+ *          #H5S_BLOCK or #H5S_PLIST selections, and not recursively: an
  *          H5Dwrite() or H5Dread() the callback itself issues on \p dset_id
  *          takes the normal per-chunk path.
+ *
+ *          Other pipeline entries: the callback runs them, once per
+ *          compression unit, with H5Zapply_pipeline() -- the entries before
+ *          this filter on the unit's input, those after it on its output.
+ *
+ *          Several datasets: each dataset of an H5Dwrite_multi() is offered
+ *          to its own filter; the datasets that are declined, or have no
+ *          such filter, are then written together through the normal path.
+ *
+ *          MPI file drivers: a write is offered only with collective
+ *          transfer (#H5FD_MPIO_COLLECTIVE), on every rank or on none.
+ *          Each rank's callback handles its own selection, and the chunks it
+ *          stores with H5Dwrite_chunk() are held and written by all ranks
+ *          together after every callback has returned (file space and the
+ *          chunk index are updated collectively, as for a collective write
+ *          of filtered chunks). All ranks must return the same sign; one
+ *          rank's failure fails the request on every rank. No two ranks may
+ *          store the same chunk.
  *
  * \since 3.0.0
  */
@@ -555,6 +571,15 @@ typedef htri_t (*H5Z_dset_write_func_t)(void *state, hid_t dset_id, hid_t mem_ty
  */
 typedef htri_t (*H5Z_dset_read_func_t)(void *state, hid_t dset_id, hid_t mem_type_id, hid_t mem_space_id,
                                        hid_t file_space_id, hid_t dxpl_id, void *buf);
+
+/**
+ * Which pipeline entries H5Zapply_pipeline() runs, relative to the filter
+ * whose dataset-level callback is calling it. \since 3.0.0
+ */
+typedef enum H5Z_pipeline_part_t {
+    H5Z_PIPELINE_BEFORE = 0, /**< The entries before that filter */
+    H5Z_PIPELINE_AFTER  = 1  /**< The entries after that filter */
+} H5Z_pipeline_part_t;
 
 /**
  * \brief Version 3 filter class structure with optional string-configuration,
@@ -980,6 +1005,49 @@ H5_DLL herr_t H5Zregister(const void *cls);
  * \since 1.6.0
  */
 H5_DLL herr_t H5Zunregister(H5Z_filter_t id);
+
+/**
+ * \ingroup H5Z
+ *
+ * \brief Runs the other entries of a dataset's filter pipeline on one buffer,
+ *        from within a dataset-level callback
+ *
+ * \param[in]     dset_id     The dataset ID handed to the \c dset_write or
+ *                            \c dset_read callback
+ * \param[in]     part        #H5Z_PIPELINE_BEFORE: the entries before the
+ *                            calling filter; #H5Z_PIPELINE_AFTER: those after it
+ * \param[in]     flags       0 to apply the filters (write direction), or
+ *                            #H5Z_FLAG_REVERSE to undo them (read direction)
+ * \param[in]     dxpl_id     Transfer property list passed to the filters
+ * \param[in]     scaled      Scaled coordinates passed to the filters (may be
+ *                            NULL)
+ * \param[in,out] filter_mask In: pipeline entries to skip; out: the entries in
+ *                            the range that were skipped (an optional filter
+ *                            that failed). Uses the pipeline's bit numbering, as
+ *                            the \p filters argument of H5Dwrite_chunk() does.
+ *                            May be NULL.
+ * \param[in,out] nbytes      Number of valid bytes in \p *buf
+ * \param[in,out] buf_size    Allocated size of \p *buf
+ * \param[in,out] buf         The data; a filter may replace the buffer, so it
+ *                            must have been allocated with H5allocate_memory()
+ *                            (or malloc() when memory debugging is off)
+ *
+ * \return \herr_t
+ *
+ * \details A dataset-level filter replaces the per-chunk pipeline for the
+ *          requests it handles, so the other filters of the dataset run when
+ *          it calls this function, once per compression unit: on write,
+ *          #H5Z_PIPELINE_BEFORE on the unit's data before compressing it and
+ *          #H5Z_PIPELINE_AFTER on the compressed stream; on read, the reverse.
+ *          When the unit is one chunk the stored bytes are exactly those the
+ *          per-chunk pipeline produces. Valid only while a dataset-level
+ *          callback for \p dset_id is running.
+ *
+ * \since 3.0.0
+ */
+H5_DLL herr_t H5Zapply_pipeline(hid_t dset_id, H5Z_pipeline_part_t part, unsigned flags, hid_t dxpl_id,
+                                const hsize_t *scaled, unsigned *filter_mask, size_t *nbytes,
+                                size_t *buf_size, void **buf);
 
 #ifdef __cplusplus
 }
